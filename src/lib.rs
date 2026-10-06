@@ -1,4 +1,5 @@
-//! Chapter Freight — the signed binary pack-bundle format.
+//! The Aivyx pack format — signed bundles for vertical packs, shared by
+//! aivyx-pa and aivyx-coder.
 //!
 //! A pack bundle (`<name>-<version>-<target>.aivyxpack`) is an **outer
 //! plain tar** with exactly three entries:
@@ -19,7 +20,7 @@
 //! Extraction is path-sanitized: absolute paths, `..` components, and
 //! symlink entries are refused outright, so a malicious archive cannot
 //! write outside its install directory even if signature checking were
-//! misconfigured. See `docs/FREIGHT.md`.
+//! misconfigured. See README.md.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -30,16 +31,17 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::Deserialize;
 use thiserror::Error;
 
-/// Compiled-in Aivyx publisher verifying keys (base64). Empty until the
+/// Compiled-in Aivyx publisher verifying keys (base64), shared by every
+/// Aivyx product that installs packs. Empty until the
 /// v1.0 web presence establishes the real publisher key ceremony — an
 /// empty set means only operator-configured `[pack] trusted_publishers`
 /// verify. Deliberately NOT a placeholder key: a placeholder anyone can
 /// read is worse than none.
-pub const AIVYX_PA_PUBLISHER_KEYS: &[&str] = &[];
+pub const AIVYX_PUBLISHER_KEYS: &[&str] = &[];
 
 /// The target triple this binary was built for (relayed by build.rs) —
 /// `pack install` refuses bundles built for a foreign platform.
-pub const HOST_TARGET: &str = env!("AIVYX_PA_BUILD_TARGET");
+pub const HOST_TARGET: &str = env!("AIVYX_PACK_BUILD_TARGET");
 
 const PAYLOAD_NAME: &str = "payload.tar.gz";
 const SIGNATURE_NAME: &str = "signature.bin";
@@ -416,7 +418,7 @@ pub fn read_bundle(path: &Path) -> Result<ReadBundle, PackError> {
 }
 
 /// Verify a bundle against the trusted publisher set (operator config
-/// unioned with [`AIVYX_PA_PUBLISHER_KEYS`]). The `publisher.txt` hint
+/// unioned with [`AIVYX_PUBLISHER_KEYS`]). The `publisher.txt` hint
 /// selects which trusted key to check — it must decode to a key that is
 /// BYTE-IDENTICAL to a trusted entry; an unknown key is refused before
 /// any signature math.
@@ -430,7 +432,7 @@ pub fn verify_bundle(
     let trusted = trusted_publishers
         .iter()
         .map(String::as_str)
-        .chain(AIVYX_PA_PUBLISHER_KEYS.iter().copied())
+        .chain(AIVYX_PUBLISHER_KEYS.iter().copied())
         .filter_map(decode_verifying_key)
         .any(|k| k == hint);
     if !trusted {
@@ -461,7 +463,7 @@ pub fn read_manifest(payload: &[u8]) -> Result<PackManifest, PackError> {
 
 /// True when `rel` is a safe archive-relative path: no absolute roots,
 /// no `..`, no prefix components. `pub` so callers outside this crate
-/// (e.g. `aivyx-cli`'s pack installer) can apply the same check to
+/// (e.g. a product's pack installer) can apply the same check to
 /// manifest-declared paths (`bin`, `team_config`) before joining them
 /// onto an install directory.
 pub fn safe_relative(rel: &Path) -> bool {

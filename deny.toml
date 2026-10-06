@@ -1,0 +1,45 @@
+# cargo-deny configuration — dependency license policy.
+#
+# Run: `cargo deny check licenses`
+#
+# aivyx-pack is BUSL-1.1 (see LICENSE). NO dependency may impose copyleft
+# (GPL/LGPL-only/AGPL/SSPL/EPL/CDDL) on the combined work, so this
+# allow-list is permissive-only — the same list aivyx-pa and the other
+# shared Aivyx crates use. cargo-deny rejects anything not listed.
+
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+# Skip this crate itself (BUSL-1.1, publish = false): it must not be
+# measured against the dependency allow-list below. A THIRD-PARTY crate
+# under BUSL or any copyleft still fails loudly, which is the point.
+private = { ignore = true }
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "BSL-1.0",
+    "0BSD",
+    "Unlicense",
+    "WTFPL",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    "NCSA",
+    # MPL-2.0 is file-level (weak) copyleft: it never relicenses the
+    # combined work. Kept so the list matches the other Aivyx repos.
+    "MPL-2.0",
+]
+
+# No per-crate license exceptions. `cargo deny check licenses`
+# (all-features) is green with no exceptions -- verified directly
+# against this exact allow-list before this file was committed. Any
+# future copyleft dep now fails the gate loudly.

@@ -1,21 +1,21 @@
+[workspace]
+
 [package]
 name = "aivyx-pack"
-description = "The signed binary pack-bundle format — build, sign, verify, unpack (Chapter Freight). See docs/FREIGHT.md."
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-publish.workspace = true
-authors.workspace = true
-repository.workspace = true
+description = "Signed pack bundles for Aivyx vertical packs — build, sign, verify, unpack"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "BUSL-1.1"
+publish = false
+repository = "https://github.com/Aivyx-Agent/aivyx-pack"
 
 [dependencies]
-base64 = { workspace = true }
-ed25519-dalek = { workspace = true }
-flate2 = { workspace = true }
-serde = { workspace = true }
-tar = { workspace = true }
-rand = { workspace = true }
-thiserror = { workspace = true }
-# Same rationale as aivyx-config: `toml` is the de-facto parser.
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+flate2 = "1"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+tar = "0.4"
+thiserror = "2"
 toml = "0.8"
