@@ -33,6 +33,7 @@ use thiserror::Error;
 
 mod config_pack;
 pub use config_pack::{CoderPart, ConfigPackManifest, PaPart, Product};
+pub mod describe;
 
 /// Compiled-in Aivyx publisher verifying keys (base64), shared by every
 /// Aivyx product that installs packs. Empty until the
