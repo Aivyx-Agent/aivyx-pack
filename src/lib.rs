@@ -31,6 +31,9 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::Deserialize;
 use thiserror::Error;
 
+mod config_pack;
+pub use config_pack::{CoderPart, ConfigPackManifest, PaPart, Product};
+
 /// Compiled-in Aivyx publisher verifying keys (base64), shared by every
 /// Aivyx product that installs packs. Empty until the
 /// v1.0 web presence establishes the real publisher key ceremony — an
@@ -97,6 +100,11 @@ pub enum PackError {
          upgrade Aivyx first"
     )]
     DaemonTooOld { required: String, current: String },
+    #[error(
+        "this pack uses format {format}, which this version can't install — \
+         upgrade to install it"
+    )]
+    UnsupportedFormat { format: u32 },
 }
 
 /// One `[[tool_process]]` a pack wires at install (the Mise pattern).
@@ -150,24 +158,80 @@ impl PackManifest {
                 ));
             }
         }
-        // The name becomes an install directory component — keep it boring.
-        if !m
-            .name
+        check_name(&m.name)?;
+        Ok(m)
+    }
+}
+
+/// The name becomes an install directory component — keep it boring.
+pub(crate) fn check_name(name: &str) -> Result<(), PackError> {
+    if name.is_empty()
+        || !name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            return Err(PackError::BadManifest(format!(
-                "pack name {:?} must be alphanumeric/dash/underscore",
-                m.name
-            )));
+    {
+        return Err(PackError::BadManifest(format!(
+            "pack name {name:?} must be alphanumeric/dash/underscore"
+        )));
+    }
+    Ok(())
+}
+
+/// Either manifest format, dispatched on the `format` key (absent ⇒ 1).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Manifest {
+    /// Format 1: tool-process binaries + team configs for one platform.
+    Binary(PackManifest),
+    /// Format 2: configuration only, for aivyx-pa and/or aivyx-coder.
+    Config(ConfigPackManifest),
+}
+
+impl Manifest {
+    pub fn parse(text: &str) -> Result<Self, PackError> {
+        let mut value: toml::Table =
+            toml::from_str(text).map_err(|e| PackError::BadManifest(e.to_string()))?;
+        let format = match value.get("format") {
+            None => 1,
+            Some(toml::Value::Integer(n)) => u32::try_from(*n)
+                .map_err(|_| PackError::BadManifest(format!("format {n} is not a version")))?,
+            Some(other) => {
+                return Err(PackError::BadManifest(format!(
+                    "format must be a number, not {other}"
+                )));
+            }
+        };
+        match format {
+            1 => {
+                // Format 1 predates the key; drop an explicit `format = 1`
+                // so its strict parser sees the shape it always has.
+                value.remove("format");
+                let text = toml::to_string(&value)
+                    .map_err(|e| PackError::BadManifest(e.to_string()))?;
+                PackManifest::parse(&text).map(Manifest::Binary)
+            }
+            2 => ConfigPackManifest::parse(text).map(Manifest::Config),
+            format => Err(PackError::UnsupportedFormat { format }),
         }
-        Ok(m)
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Manifest::Binary(m) => &m.name,
+            Manifest::Config(m) => &m.name,
+        }
+    }
+
+    pub fn version(&self) -> &str {
+        match self {
+            Manifest::Binary(m) => &m.version,
+            Manifest::Config(m) => &m.version,
+        }
     }
 }
 
 /// Parse `x.y.z` (extra pre-release/build suffixes rejected — pack
 /// version gates should be boring).
-fn semverish(s: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn semverish(s: &str) -> Option<(u64, u64, u64)> {
     let mut it = s.trim().split('.');
     let maj = it.next()?.parse().ok()?;
     let min = it.next()?.parse().ok()?;
@@ -245,12 +309,29 @@ pub fn build_payload(staging: &Path) -> Result<Vec<u8>, PackError> {
     let manifest_path = staging.join(MANIFEST_NAME);
     let manifest_text = std::fs::read_to_string(&manifest_path)
         .map_err(|_| PackError::MissingManifest)?;
-    PackManifest::parse(&manifest_text)?;
+    // Format 1 packs `bin/` + `config/`; format 2 packs each listed
+    // product's folder, after checking every file it names is there.
+    let dirs: Vec<&str> = match Manifest::parse(&manifest_text)? {
+        Manifest::Binary(_) => vec!["bin", "config"],
+        Manifest::Config(m) => {
+            for (field, rel, is_dir) in m.paths() {
+                let path = staging.join(rel);
+                let ok = if is_dir { path.is_dir() } else { path.is_file() };
+                if !ok {
+                    return Err(PackError::BadManifest(format!(
+                        "{field} names {rel:?} but the staging dir has no such {}",
+                        if is_dir { "folder" } else { "file" }
+                    )));
+                }
+            }
+            m.products.iter().map(|p| p.as_str()).collect()
+        }
+    };
 
-    // Collect files: manifest + everything under bin/ and config/.
+    // Collect files: the manifest + everything under those folders.
     let mut files: BTreeMap<String, PathBuf> = BTreeMap::new();
     files.insert(MANIFEST_NAME.to_string(), manifest_path);
-    for dir in ["bin", "config"] {
+    for dir in dirs {
         let root = staging.join(dir);
         if !root.is_dir() {
             continue;
@@ -446,8 +527,20 @@ pub fn verify_bundle(
     Ok(hint)
 }
 
-/// Read the manifest out of a (verified) payload without unpacking.
+/// Read a format-1 manifest out of a (verified) payload without
+/// unpacking. A newer format is refused with
+/// [`PackError::UnsupportedFormat`], so an installer that only knows tool
+/// packs says so clearly; [`read_any_manifest`] reads either.
 pub fn read_manifest(payload: &[u8]) -> Result<PackManifest, PackError> {
+    match read_any_manifest(payload)? {
+        Manifest::Binary(m) => Ok(m),
+        Manifest::Config(m) => Err(PackError::UnsupportedFormat { format: m.format }),
+    }
+}
+
+/// Read the manifest (either format) out of a (verified) payload without
+/// unpacking.
+pub fn read_any_manifest(payload: &[u8]) -> Result<Manifest, PackError> {
     let gz = flate2::read::GzDecoder::new(payload);
     let mut archive = tar::Archive::new(gz);
     for entry in archive.entries()? {
@@ -455,7 +548,7 @@ pub fn read_manifest(payload: &[u8]) -> Result<PackManifest, PackError> {
         if entry.path()?.to_string_lossy() == MANIFEST_NAME {
             let mut text = String::new();
             entry.read_to_string(&mut text)?;
-            return PackManifest::parse(&text);
+            return Manifest::parse(&text);
         }
     }
     Err(PackError::MissingManifest)
@@ -592,6 +685,82 @@ bin = "aivyx-kitchen-toolkit"
         }
         std::fs::write(dir.join("config/kitchen-boh.toml"), "[team]\n").unwrap();
         dir
+    }
+
+    // ---- Format 2: config packs ----
+
+    use crate::config_pack::tests::BM;
+
+    /// A staging dir for the BM config pack: its manifest, every file it
+    /// names, and a README that must not be packed.
+    fn stage_config(tag: &str) -> PathBuf {
+        let dir = tmpdir(tag);
+        std::fs::write(dir.join("manifest.toml"), BM).unwrap();
+        for (rel, body) in [
+            ("pa/aivyx-pa.toml", "[profile]\n"),
+            ("pa/team.toml", "[team]\n"),
+            ("pa/skills/x/SKILL.md", "---\nname: x\n---\n"),
+            ("coder/AGENTS.md", "# Instructions\n"),
+            ("coder/skills/y/SKILL.md", "---\nname: y\n---\n"),
+            ("README.md", "not packed\n"),
+        ] {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn manifest_dispatches_on_format() {
+        assert!(matches!(Manifest::parse(BM).unwrap(), Manifest::Config(_)));
+        assert!(matches!(Manifest::parse(MANIFEST).unwrap(), Manifest::Binary(_)));
+        let explicit_one = format!("format = 1\n{MANIFEST}");
+        let Manifest::Binary(m) = Manifest::parse(&explicit_one).unwrap() else {
+            panic!("format 1 is a tool pack")
+        };
+        assert_eq!(m.tool_processes.len(), 1);
+        let three = BM.replace("format = 2", "format = 3");
+        assert!(matches!(
+            Manifest::parse(&three),
+            Err(PackError::UnsupportedFormat { format: 3 })
+        ));
+    }
+
+    #[test]
+    fn a_config_pack_round_trips_and_read_manifest_refuses_it() {
+        let staging = stage_config("cfg-roundtrip");
+        let key = keypair();
+        let payload = build_payload(&staging).unwrap();
+        let bundle_path = tmpdir("cfg-roundtrip-out").join("bm.aivyxpack");
+        write_bundle(&payload, &key, &bundle_path).unwrap();
+        let bundle = read_bundle(&bundle_path).unwrap();
+        let trusted = vec![encode_verifying_key(&key.verifying_key())];
+        verify_bundle(&bundle, &trusted).unwrap();
+        let Manifest::Config(m) = read_any_manifest(&bundle.payload).unwrap() else {
+            panic!("a config pack")
+        };
+        assert_eq!(m.name, "business-manager");
+        let err = read_manifest(&bundle.payload).unwrap_err();
+        assert!(matches!(err, PackError::UnsupportedFormat { format: 2 }));
+        assert!(err.to_string().contains("format 2"), "{err}");
+        let dest = tmpdir("cfg-unpack");
+        unpack_payload(&bundle.payload, &dest).unwrap();
+        assert!(dest.join("pa/skills/x/SKILL.md").is_file());
+        assert!(dest.join("coder/AGENTS.md").is_file());
+        assert!(!dest.join("README.md").exists(), "only product folders are packed");
+    }
+
+    #[test]
+    fn a_config_pack_with_a_missing_file_does_not_build() {
+        let staging = stage_config("cfg-missing");
+        std::fs::remove_file(staging.join("pa/team.toml")).unwrap();
+        let err = build_payload(&staging).unwrap_err().to_string();
+        assert!(err.contains("pa/team.toml"), "{err}");
+        std::fs::remove_dir_all(staging.join("coder/skills")).unwrap();
+        std::fs::write(staging.join("pa/team.toml"), "[team]\n").unwrap();
+        let err = build_payload(&staging).unwrap_err().to_string();
+        assert!(err.contains("coder/skills") && err.contains("folder"), "{err}");
     }
 
     #[test]
