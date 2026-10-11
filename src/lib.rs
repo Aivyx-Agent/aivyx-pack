@@ -160,8 +160,22 @@ impl PackManifest {
             }
         }
         check_name(&m.name)?;
+        // Both are `x.y.z`, as documented; `version` is also an install
+        // directory component, so nothing else may get through (a
+        // `../../../.local` version unpacked a pack's bin/ onto PATH).
+        let versions = [("version", &m.version), ("min_daemon_version", &m.min_daemon_version)];
+        for (field, value) in versions {
+            if !is_plain_version(value) {
+                return Err(PackError::BadManifest(format!("{field} {value:?} must be x.y.z")));
+            }
+        }
         Ok(m)
     }
+}
+
+/// `x.y.z` and nothing else — digits and two dots, no spaces or suffixes.
+fn is_plain_version(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_digit() || b == b'.') && semverish(s).is_some()
 }
 
 /// The name becomes an install directory component — keep it boring.
@@ -874,6 +888,21 @@ bin = "aivyx-kitchen-toolkit"
     fn manifest_rejects_sneaky_names() {
         let bad = MANIFEST.replace("\"kitchen\"", "\"../kitchen\"");
         assert!(PackManifest::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_a_version_that_isnt_x_y_z() {
+        // The version is an install-directory component: `../../../.local`
+        // unpacked a signed pack's bin/ into ~/.local/bin, on PATH.
+        let with_version = |v: &str| {
+            let mut m: toml::Table = toml::from_str(MANIFEST).unwrap();
+            m.insert("version".into(), toml::Value::String(v.into()));
+            toml::to_string(&m).unwrap()
+        };
+        for bad in ["../../../.local", "1.0.0/../../x", "1.0", "1.0.0-beta", "", " 1.0.0"] {
+            assert!(PackManifest::parse(&with_version(bad)).is_err(), "{bad:?} must be refused");
+        }
+        assert!(PackManifest::parse(&with_version("1.0.0")).is_ok());
     }
 
     #[test]
