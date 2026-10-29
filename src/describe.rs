@@ -10,8 +10,19 @@ use crate::config_pack::ConfigPackManifest;
 /// reads before installing it.
 pub fn shown(text: &str) -> String {
     text.chars()
-        .map(|c| if c.is_control() { c.escape_default().to_string() } else { c.to_string() })
+        .map(|c| if c.is_control() || is_invisible_format(c) { c.escape_default().to_string() } else { c.to_string() })
         .collect()
+}
+
+/// Invisible format characters (Unicode category Cf, plus the variation
+/// selectors): bidi overrides and isolates, zero-width characters, the tag
+/// block. They render as nothing, or reorder the text around them.
+fn is_invisible_format(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x08E2 | 0x180E
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0xFE00..=0xFE0F
+        | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x1D173..=0x1D17A
+        | 0xE0001 | 0xE0020..=0xE007F | 0xE0100..=0xE01EF)
 }
 
 /// One line saying what kind of pack this is: `tool pack for <target>` or
@@ -108,6 +119,16 @@ mod tests {
         assert!(text.contains("  requires: gmail, calendar\n"), "{text}");
         assert!(text.contains("  optional: notion\n"), "{text}");
         assert!(text.contains("  instructions: coder/AGENTS.md\n"), "{text}");
+    }
+
+    #[test]
+    fn bidi_and_invisible_format_characters_are_shown_escaped() {
+        let shown = shown("a\u{202e}b\u{2066}c\u{200b}d\u{feff}e\u{e0041}f");
+        for c in ['\u{202e}', '\u{2066}', '\u{200b}', '\u{feff}', '\u{e0041}'] {
+            assert!(!shown.contains(c), "{shown:?}");
+        }
+        assert!(shown.contains("\\u{202e}"), "{shown}");
+        assert_eq!(super::shown("plain \u{e9}"), "plain \u{e9}");
     }
 
     #[test]
