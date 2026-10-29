@@ -63,6 +63,10 @@ const MAX_BUNDLE_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 /// expansion attack.
 const MAX_DECOMPRESSION_RATIO: u64 = 20;
 
+/// A manifest larger than this is refused (it is read before any signature
+/// is trusted by `inspect --allow-untrusted`).
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
 /// Floor on the decompression budget so a tiny (sub-KB) compressed
 /// payload isn't capped down to something that can't even hold a
 /// legitimate manifest + small binary.
@@ -556,13 +560,22 @@ pub fn read_manifest(payload: &[u8]) -> Result<PackManifest, PackError> {
 /// Read the manifest (either format) out of a (verified) payload without
 /// unpacking.
 pub fn read_any_manifest(payload: &[u8]) -> Result<Manifest, PackError> {
+    let max_decompressed = (payload.len() as u64)
+        .saturating_mul(MAX_DECOMPRESSION_RATIO)
+        .max(MIN_DECOMPRESSED_BYTES);
     let gz = flate2::read::GzDecoder::new(payload);
-    let mut archive = tar::Archive::new(gz);
+    let capped = RatioCappedReader { inner: gz, remaining: max_decompressed };
+    let mut archive = tar::Archive::new(capped);
     for entry in archive.entries()? {
         let mut entry = entry?;
         if entry.path()?.to_string_lossy() == MANIFEST_NAME {
             let mut text = String::new();
-            entry.read_to_string(&mut text)?;
+            (&mut entry).take(MAX_MANIFEST_BYTES + 1).read_to_string(&mut text)?;
+            if text.len() as u64 > MAX_MANIFEST_BYTES {
+                return Err(PackError::BadManifest(format!(
+                    "{MANIFEST_NAME} is larger than the {MAX_MANIFEST_BYTES}-byte limit"
+                )));
+            }
             return Manifest::parse(&text);
         }
     }
@@ -700,6 +713,26 @@ bin = "aivyx-kitchen-toolkit"
         }
         std::fs::write(dir.join("config/kitchen-boh.toml"), "[team]\n").unwrap();
         dir
+    }
+
+    #[test]
+    fn an_oversized_manifest_is_refused_when_read_without_trust() {
+        let body = vec![b'#'; (MAX_MANIFEST_BYTES as usize) + 10];
+        let mut tarball = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tarball);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, MANIFEST_NAME, &body[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tarball).unwrap();
+        let payload = gz.finish().unwrap();
+        let err = read_any_manifest(&payload).unwrap_err().to_string();
+        assert!(err.contains("limit") || err.contains("ratio"), "{err}");
     }
 
     // ---- Format 2: config packs ----
