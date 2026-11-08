@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{PackError, check_name, safe_relative, semverish};
 
@@ -68,6 +68,40 @@ pub struct CoderPart {
     /// MCP server definitions (enabled only with the user's consent).
     #[serde(default)]
     pub mcp: Option<String>,
+    /// `coder/settings.toml`: verification commands (format 2, coder 1.0.0+).
+    #[serde(default)]
+    pub settings: Option<String>,
+}
+
+/// `coder/settings.toml`: the only settings a pack may set.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CoderSettings {
+    #[serde(default)]
+    pub verification: PackVerification,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PackVerification {
+    pub command: Option<String>,
+    pub scoped_command: Option<String>,
+    #[serde(default)]
+    pub final_checks: Vec<String>,
+}
+
+/// Parse a pack's `coder/settings.toml`: only `[verification]` commands, none empty.
+pub fn check_coder_settings(text: &str) -> Result<CoderSettings, PackError> {
+    let s: CoderSettings = toml::from_str(text).map_err(|e| bad(format!("settings: {e}")))?;
+    let v = &s.verification;
+    let empty = |c: &String| c.trim().is_empty();
+    if v.command.iter().any(empty)
+        || v.scoped_command.iter().any(empty)
+        || v.final_checks.iter().any(empty)
+    {
+        return Err(bad("settings: empty command"));
+    }
+    Ok(s)
 }
 
 /// A format-2 manifest.
@@ -143,6 +177,11 @@ impl ConfigPackManifest {
         }
         if let Some(coder) = &m.coder {
             check_version("coder.min_version", &coder.min_version)?;
+            if coder.settings.is_some()
+                && semverish(&coder.min_version).is_some_and(|v| v < (1, 0, 0))
+            {
+                return Err(bad("coder.settings needs coder.min_version 1.0.0 or later"));
+            }
         }
         for (field, path, part, _) in m.named_paths() {
             check_path(field, path, part)?;
@@ -168,6 +207,7 @@ impl ConfigPackManifest {
                 ("coder.skills", &coder.skills, true),
                 ("coder.roster", &coder.roster, false),
                 ("coder.mcp", &coder.mcp, false),
+                ("coder.settings", &coder.settings, false),
             ] {
                 if let Some(p) = p {
                     out.push((field, p.as_str(), Product::Coder, dir));
@@ -253,5 +293,46 @@ skills = "coder/skills"
         assert!(ConfigPackManifest::parse(&extra).is_err());
         let name = BM.replace("business-manager", "../bm");
         assert!(ConfigPackManifest::parse(&name).is_err());
+    }
+
+    #[test]
+    fn coder_settings_needs_min_version_1() {
+        let text = BM
+            .replace("min_version = \"0.5.0\"", "min_version = \"0.9.0\"")
+            .replace(
+                "agents_file = \"coder/AGENTS.md\"",
+                "agents_file = \"coder/AGENTS.md\"\nsettings = \"coder/settings.toml\"",
+            );
+        let err = ConfigPackManifest::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("coder.settings needs coder.min_version 1.0.0 or later"), "{err}");
+        let ok = text.replace("0.9.0", "1.0.0");
+        assert!(ConfigPackManifest::parse(&ok).is_ok());
+    }
+
+    #[test]
+    fn coder_settings_path_must_be_inside_coder() {
+        let text = BM
+            .replace("min_version = \"0.5.0\"", "min_version = \"1.0.0\"")
+            .replace(
+                "agents_file = \"coder/AGENTS.md\"",
+                "agents_file = \"coder/AGENTS.md\"\nsettings = \"../x.toml\"",
+            );
+        assert!(ConfigPackManifest::parse(&text).is_err());
+    }
+
+    #[test]
+    fn settings_file_allows_only_verification_commands() {
+        let ok = "[verification]\ncommand = \"cargo test\"\nfinal_checks = [\"cargo fmt --check\"]\n";
+        let s = check_coder_settings(ok).unwrap();
+        assert_eq!(s.verification.command.as_deref(), Some("cargo test"));
+        for bad in [
+            "[backend]\nmodel = \"x\"\n",
+            "[verification]\nfinal_check_retries = 5\n",
+            "[permissions]\nmode = \"auto\"\n",
+            "[verification]\ncommand = \"\"\n",
+            "[verification]\nfinal_checks = [\"  \"]\n",
+        ] {
+            assert!(check_coder_settings(bad).is_err(), "{bad}");
+        }
     }
 }

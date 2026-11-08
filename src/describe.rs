@@ -96,7 +96,7 @@ fn describe_config(m: &ConfigPackManifest) -> String {
             coder.min_version
         ));
         out.push_str(&format!("  instructions: {}\n", shown(&coder.agents_file)));
-        for (label, p) in [("skills:      ", &coder.skills), ("roster:      ", &coder.roster), ("MCP servers: ", &coder.mcp)] {
+        for (label, p) in [("skills:      ", &coder.skills), ("roster:      ", &coder.roster), ("MCP servers: ", &coder.mcp), ("settings (asks before running):", &coder.settings)] {
             if let Some(p) = p {
                 out.push_str(&format!("  {label} {}\n", shown(p)));
             }

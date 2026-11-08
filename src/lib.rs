@@ -32,7 +32,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 mod config_pack;
-pub use config_pack::{CoderPart, ConfigPackManifest, PaPart, Product};
+pub use config_pack::{CoderPart, CoderSettings, PackVerification, check_coder_settings, ConfigPackManifest, PaPart, Product};
 pub mod describe;
 #[cfg(feature = "yubikey")]
 #[doc(hidden)]
@@ -203,6 +203,7 @@ pub(crate) fn check_name(name: &str) -> Result<(), PackError> {
 
 /// Either manifest format, dispatched on the `format` key (absent ⇒ 1).
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // public enum; boxing would break consumers
 pub enum Manifest {
     /// Format 1: tool-process binaries + team configs for one platform.
     Binary(PackManifest),
@@ -347,6 +348,11 @@ pub fn build_payload(staging: &Path) -> Result<Vec<u8>, PackError> {
                         if is_dir { "folder" } else { "file" }
                     )));
                 }
+            }
+            if let Some(rel) = m.coder.as_ref().and_then(|c| c.settings.as_deref()) {
+                let text = std::fs::read_to_string(staging.join(rel))
+                    .map_err(|e| PackError::BadManifest(format!("coder.settings {rel:?}: {e}")))?;
+                check_coder_settings(&text)?;
             }
             m.products.iter().map(|p| p.as_str()).collect()
         }
@@ -1013,6 +1019,23 @@ bin = "aivyx-kitchen-toolkit"
         std::fs::write(staging.join("pa/team.toml"), "[team]\n").unwrap();
         let err = build_payload(&staging).unwrap_err().to_string();
         assert!(err.contains("coder/skills") && err.contains("folder"), "{err}");
+    }
+
+    #[test]
+    fn a_pack_with_an_invalid_settings_file_does_not_build() {
+        let staging = stage_config("cfg-settings");
+        let text = std::fs::read_to_string(staging.join("manifest.toml")).unwrap()
+            .replace("min_version = \"0.5.0\"", "min_version = \"1.0.0\"")
+            .replace(
+                "agents_file = \"coder/AGENTS.md\"",
+                "agents_file = \"coder/AGENTS.md\"\nsettings = \"coder/settings.toml\"",
+            );
+        std::fs::write(staging.join("manifest.toml"), text).unwrap();
+        std::fs::write(staging.join("coder/settings.toml"), "[backend]\nmodel = \"x\"\n").unwrap();
+        let err = build_payload(&staging).unwrap_err().to_string();
+        assert!(err.contains("settings"), "{err}");
+        std::fs::write(staging.join("coder/settings.toml"), "[verification]\ncommand = \"cargo test\"\n").unwrap();
+        build_payload(&staging).unwrap();
     }
 
     #[test]
