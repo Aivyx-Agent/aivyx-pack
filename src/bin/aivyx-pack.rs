@@ -48,13 +48,31 @@ impl Command {
     }
 }
 
+/// A path or value argument. One starting with `-` is almost certainly a
+/// mistyped option, so it is refused rather than used as a file name
+/// (`./-name` names such a file).
+fn operand<'a>(what: &str, value: &'a str) -> Result<&'a str, String> {
+    if value.starts_with('-') {
+        return Err(format!(
+            "{what} {value:?} starts with '-' and looks like an option (write ./{value} for such a name)"
+        ));
+    }
+    Ok(value)
+}
+
 /// `Err` is a usage error (exit 2).
 fn parse(args: &[String]) -> Result<Command, String> {
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    if words.iter().any(|w| matches!(*w, "--help" | "-h")) {
+        return Ok(Command::Help);
+    }
     match words.as_slice() {
-        [] | ["help"] | ["--help"] | ["-h"] => Ok(Command::Help),
-        ["keygen", keyfile] => Ok(Command::Keygen { keyfile: keyfile.to_string() }),
+        [] | ["help"] => Ok(Command::Help),
+        ["keygen", keyfile] => {
+            Ok(Command::Keygen { keyfile: operand("keyfile", keyfile)?.to_string() })
+        }
         ["build", staging, rest @ ..] => {
+            let staging = operand("staging dir", staging)?;
             let (mut key, mut out, mut yubikey, mut serial) = (None, None, false, None);
             let mut it = rest.iter();
             while let Some(flag) = it.next() {
@@ -62,7 +80,11 @@ fn parse(args: &[String]) -> Result<Command, String> {
                     yubikey = true;
                     continue;
                 }
+                if !matches!(*flag, "--key" | "--out" | "--serial") {
+                    return Err(format!("unknown option {flag}"));
+                }
                 let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
+                let value = operand(&format!("the value of {flag}:"), value)?;
                 match *flag {
                     "--key" => key = Some(value.to_string()),
                     "--out" => out = Some(value.to_string()),
@@ -91,7 +113,8 @@ fn parse(args: &[String]) -> Result<Command, String> {
             while let Some(flag) = it.next() {
                 match *flag {
                     "--serial" => {
-                        serial = Some(it.next().ok_or("--serial needs a value")?.to_string())
+                        let v = it.next().ok_or("--serial needs a value")?;
+                        serial = Some(operand("the value of --serial:", v)?.to_string())
                     }
                     "--overwrite-existing-key" => overwrite_existing_key = true,
                     other => return Err(format!("unknown option {other}")),
@@ -100,12 +123,14 @@ fn parse(args: &[String]) -> Result<Command, String> {
             Ok(Command::YubikeyInit { serial, overwrite_existing_key })
         }
         ["inspect", file, rest @ ..] => {
+            let file = operand("file", file)?;
             let (mut trust, mut allow_untrusted) = (Vec::new(), false);
             let mut it = rest.iter();
             while let Some(flag) = it.next() {
                 match *flag {
                     "--trust" => {
-                        trust.push(it.next().ok_or("--trust needs a key")?.to_string())
+                        let v = it.next().ok_or("--trust needs a key")?;
+                        trust.push(operand("the value of --trust:", v)?.to_string())
                     }
                     "--allow-untrusted" => allow_untrusted = true,
                     other => return Err(format!("unknown option {other}")),

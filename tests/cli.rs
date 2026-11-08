@@ -123,3 +123,64 @@ fn yubikey_commands_need_the_feature() {
         assert!(String::from_utf8_lossy(&out.stderr).contains(no_support), "{args:?}");
     }
 }
+
+/// Runs the CLI in an empty directory; returns (exit code, stdout, stderr)
+/// and asserts the run created nothing there.
+fn run_in_empty_dir(tag: &str, args: &[&str]) -> (Option<i32>, String, String) {
+    let dir = tempdir(tag);
+    let out = bin().args(args).current_dir(&dir).output().unwrap();
+    let left: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert!(left.is_empty(), "{args:?} created {left:?}");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn help_anywhere_prints_usage_and_writes_nothing() {
+    for args in [
+        &["keygen", "--help"][..],
+        &["keygen", "-h"][..],
+        &["--help"][..],
+        &["build", "--help"][..],
+        &["build", "x", "--key", "k", "--out", "o", "-h"][..],
+        &["inspect", "--help"][..],
+        &["yubikey-init", "--help"][..],
+    ] {
+        let (code, stdout, _) = run_in_empty_dir("help", args);
+        assert_eq!(code, Some(0), "{args:?}");
+        assert!(stdout.contains("aivyx-pack keygen"), "{args:?}");
+    }
+}
+
+#[test]
+fn dash_leading_operands_are_usage_errors_and_write_nothing() {
+    for args in [
+        &["keygen", "-x"][..],
+        &["keygen", "--"][..],
+        &["keygen", "-"][..],
+        &["keygen", "--bogus"][..],
+        &["build", "--", "--key", "k", "--out", "o"][..],
+        &["build", "-s", "--key", "k", "--out", "o"][..],
+        &["build", "--key", "k", "--out", "o"][..],
+        &["build", "x", "--key", "-k", "--out", "o"][..],
+        &["build", "x", "--key", "k", "--out", "-o"][..],
+        &["build", "x", "--key", "k", "--out", "--yubikey"][..],
+        &["inspect", "-f"][..],
+        &["inspect", "f", "--trust", "-t"][..],
+    ] {
+        let (code, _, stderr) = run_in_empty_dir("dash", args);
+        assert_eq!(code, Some(2), "{args:?}");
+        assert!(stderr.contains("aivyx-pack:"), "{args:?}");
+    }
+}
+
+#[test]
+fn dot_slash_names_a_dash_file() {
+    let dir = tempdir("dotslash");
+    let out = bin().args(["keygen", "./-key"]).current_dir(&dir).output().unwrap();
+    assert!(out.status.success());
+    assert!(dir.join("-key").is_file());
+}
