@@ -101,6 +101,10 @@ pub fn check_coder_settings(text: &str) -> Result<CoderSettings, PackError> {
     {
         return Err(bad("settings: empty command"));
     }
+    let ctl = |c: &String| c.chars().any(char::is_control);
+    if v.command.iter().any(ctl) || v.scoped_command.iter().any(ctl) || v.final_checks.iter().any(ctl) {
+        return Err(bad("settings: command contains a control character"));
+    }
     Ok(s)
 }
 
@@ -334,5 +338,30 @@ skills = "coder/skills"
         ] {
             assert!(check_coder_settings(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn settings_commands_refuse_control_characters() {
+        for ch in ["\\n", "\\r", "\\u001b"] {
+            for bad in [
+                format!("[verification]\ncommand = \"a{ch}b\"\n"),
+                format!("[verification]\nscoped_command = \"a{ch}b\"\n"),
+                format!("[verification]\nfinal_checks = [\"ok\", \"a{ch}b\"]\n"),
+            ] {
+                let err = check_coder_settings(&bad).unwrap_err().to_string();
+                assert!(err.contains("command contains a control character"), "{bad:?}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn coder_settings_version_compares_numerically() {
+        let text = BM
+            .replace("min_version = \"0.5.0\"", "min_version = \"0.10.0\"")
+            .replace(
+                "agents_file = \"coder/AGENTS.md\"",
+                "agents_file = \"coder/AGENTS.md\"\nsettings = \"coder/settings.toml\"",
+            );
+        assert!(ConfigPackManifest::parse(&text).is_err());
     }
 }
