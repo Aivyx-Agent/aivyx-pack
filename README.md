@@ -54,11 +54,19 @@ agents_file = "coder/AGENTS.md"
 skills = "coder/skills"
 # roster = "coder/team.toml"
 # mcp = "coder/mcp.toml"
+# settings = "coder/settings.toml"   # needs min_version 1.0.0 or later
 ```
 
 Every path stays inside its part's folder (`pa/…`, `coder/…`), and a part is
 present exactly when its product is listed. Only the listed parts' folders
 are packed.
+
+`coder/settings.toml` may hold only a `[verification]` table (`command`,
+`scoped_command`, `final_checks`). Coder asks the user before running any of
+it, and runs each command without a shell: one program and its arguments,
+split at whitespace. Shell syntax, quoting and control characters are
+refused at build time; the only placeholder is the whole word
+`{touched_paths}`.
 
 ## For publishers: the `aivyx-pack` command
 

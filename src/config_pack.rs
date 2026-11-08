@@ -105,6 +105,18 @@ pub fn check_coder_settings(text: &str) -> Result<CoderSettings, PackError> {
     if v.command.iter().any(ctl) || v.scoped_command.iter().any(ctl) || v.final_checks.iter().any(ctl) {
         return Err(bad("settings: command contains a control character"));
     }
+    // Coder runs these without a shell (split at whitespace), so shell syntax
+    // can never work; refuse it now. `{touched_paths}` is the one placeholder.
+    const SHELL: &str = "&|;<>$`'\"(){}*?[]~#\\";
+    for c in v.command.iter().chain(&v.scoped_command).chain(&v.final_checks) {
+        for word in c.split_whitespace().filter(|w| *w != "{touched_paths}") {
+            if let Some(ch) = word.chars().find(|ch| SHELL.contains(*ch)) {
+                return Err(bad(format!(
+                    "settings: command contains shell syntax (`{ch}`); pack commands run without a shell \u{2014} write one program and its arguments"
+                )));
+            }
+        }
+    }
     Ok(s)
 }
 
@@ -363,5 +375,28 @@ skills = "coder/skills"
                 "agents_file = \"coder/AGENTS.md\"\nsettings = \"coder/settings.toml\"",
             );
         assert!(ConfigPackManifest::parse(&text).is_err());
+    }
+
+    #[test]
+    fn settings_commands_refuse_shell_syntax() {
+        for bad in [
+            "cargo build && cargo test", "a | b", "x; y", "echo \\\"hi\\\"", "echo 'hi'",
+            "echo $HOME", "ls *.rs", "a > b", "echo {touched_paths}x", "a #c",
+        ] {
+            let t = format!("[verification]\ncommand = \"{bad}\"\n");
+            let err = check_coder_settings(&t).unwrap_err().to_string();
+            assert!(err.contains("shell syntax"), "{bad}: {err}");
+            let t = format!("[verification]\nfinal_checks = [\"{bad}\"]\n");
+            assert!(check_coder_settings(&t).is_err(), "{bad}");
+            let t = format!("[verification]\nscoped_command = \"{bad}\"\n");
+            assert!(check_coder_settings(&t).is_err(), "{bad}");
+        }
+        for ok in [
+            "cargo test", "cargo clippy --all-targets -- -D warnings", "cargo fmt --check",
+            "rustfmt --check {touched_paths}",
+        ] {
+            let t = format!("[verification]\ncommand = \"{ok}\"\nscoped_command = \"{ok}\"\nfinal_checks = [\"{ok}\"]\n");
+            check_coder_settings(&t).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
     }
 }
