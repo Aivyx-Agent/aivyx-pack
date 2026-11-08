@@ -312,7 +312,7 @@ pub fn closing_check_failed(provisioned: &Provisioned, error: &str) -> String {
          check failed: {error}\n\
          new verifying key: {key}\n\
          Warning: the factory-default PIN check already used one User PIN retry, and a \
-         mistyped User PIN in this check used another. Check the counter with \
+         mistyped User PIN in this check may have used another. Check the counter with \
          `gpg --card-status` before trying again: a blocked User PIN needs the Admin PIN to \
          reset. To check the card again without re-keying it, sign a test pack with \
          `aivyx-pack build <staging-dir> --yubikey --serial {serial} --out <file>`.",

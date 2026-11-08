@@ -418,9 +418,9 @@ pub type SignFn<'a> = dyn FnMut(&[u8]) -> Result<[u8; 64], PackError> + 'a;
 /// write the bundle. The signature is checked against `public_key` before
 /// anything is written, so a wrong card or a bad signer can never produce a
 /// bundle that won't verify, and a failed signature leaves no file behind.
-/// The bundle is written to `.<name>.tmp` beside `out`, synced, and renamed
-/// over `out`, so a failed write never truncates or replaces an existing
-/// bundle.
+/// The bundle is written to a uniquely named temp file beside `out`,
+/// synced, and renamed over `out`, so a failed write never truncates or
+/// replaces an existing bundle.
 pub fn write_bundle_with(
     payload: &[u8],
     public_key: &VerifyingKey,
@@ -433,16 +433,11 @@ pub fn write_bundle_with(
         .map_err(|_| PackError::BadSignature)?;
     let publisher = encode_verifying_key(public_key);
 
-    // Written to a temp file next to `out`, synced, then renamed over it:
-    // an I/O failure never leaves a truncated bundle or destroys an
-    // existing one.
+    // Written to a temp file of its own next to `out`, synced, then renamed
+    // over it: an I/O failure never leaves a truncated bundle or destroys an
+    // existing one, and two builds to the same `out` never share a temp file.
     let tmp = bundle_temp_path(out)?;
-    let written = write_bundle_file(&tmp, payload, &signature, &publisher)
-        .and_then(|()| std::fs::rename(&tmp, out).map_err(PackError::from));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return written;
-    }
+    place_bundle(&tmp, out, payload, &signature, &publisher)?;
     // Make the rename itself durable (best effort: not every platform can
     // open a directory to sync it).
     #[cfg(unix)]
@@ -456,8 +451,8 @@ pub fn write_bundle_with(
 }
 
 /// The temp file [`write_bundle_with`] writes before renaming it over
-/// `out`: `.<name>.tmp` in `out`'s own directory, so the rename never
-/// crosses a filesystem.
+/// `out`: `.<name>.<pid>-<random hex>.tmp` in `out`'s own directory, so the
+/// rename never crosses a filesystem and concurrent builds never collide.
 fn bundle_temp_path(out: &Path) -> Result<PathBuf, PackError> {
     let name = out.file_name().ok_or_else(|| {
         PackError::Io(std::io::Error::new(
@@ -467,25 +462,36 @@ fn bundle_temp_path(out: &Path) -> Result<PathBuf, PackError> {
     })?;
     let mut tmp_name = std::ffi::OsString::from(".");
     tmp_name.push(name);
-    tmp_name.push(".tmp");
+    tmp_name.push(format!(".{}-{:016x}.tmp", std::process::id(), rand::random::<u64>()));
     Ok(out.with_file_name(tmp_name))
 }
 
-fn write_bundle_file(
+/// Write the bundle to `tmp` (a new file: `create_new` refuses anything
+/// already there, symlinks included, and never follows one), sync it, and
+/// rename it over `out`. Only a temp file this call created is ever
+/// removed, and only when a later step fails.
+fn place_bundle(
     tmp: &Path,
+    out: &Path,
     payload: &[u8],
     signature: &Signature,
     publisher: &str,
 ) -> Result<(), PackError> {
-    // A stale temp file (or a symlink planted at that name) is removed
-    // first, and `create_new` never follows a symlink, so the bundle is
-    // only ever written to a new file of our own. A directory there is
-    // left alone and fails the build.
-    match std::fs::symlink_metadata(tmp) {
-        Ok(meta) if !meta.is_dir() => std::fs::remove_file(tmp)?,
-        _ => {}
-    }
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(tmp)?;
+    let result = write_bundle_file(file, payload, signature, publisher)
+        .and_then(|()| std::fs::rename(tmp, out).map_err(PackError::from));
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
+}
+
+fn write_bundle_file(
+    file: std::fs::File,
+    payload: &[u8],
+    signature: &Signature,
+    publisher: &str,
+) -> Result<(), PackError> {
     let mut tarb = tar::Builder::new(file);
     for (name, bytes) in [
         (PAYLOAD_NAME, payload),
@@ -775,6 +781,35 @@ mod tests {
         assert!(!out.exists());
     }
 
+    fn signed(key: &SigningKey, payload: &[u8]) -> (Signature, String) {
+        (key.sign(payload), encode_verifying_key(&key.verifying_key()))
+    }
+
+    #[test]
+    fn temp_names_are_unique_and_beside_out() {
+        let out = Path::new("/some/dir/x.aivyxpack");
+        let (a, b) = (bundle_temp_path(out).unwrap(), bundle_temp_path(out).unwrap());
+        assert_ne!(a, b);
+        for t in [&a, &b] {
+            assert_eq!(t.parent(), out.parent());
+            let name = t.file_name().unwrap().to_str().unwrap();
+            let prefix = format!(".x.aivyxpack.{}-", std::process::id());
+            assert!(name.starts_with(&prefix) && name.ends_with(".tmp"), "{name}");
+        }
+        assert!(bundle_temp_path(Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn a_write_leaves_only_the_bundle() {
+        let key = keypair();
+        let dir = tmpdir("with-only-bundle");
+        write_bundle(b"payload", &key, &dir.join("x.aivyxpack")).unwrap();
+        let names: Vec<_> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["x.aivyxpack"]);
+        assert_eq!(read_bundle(&dir.join("x.aivyxpack")).unwrap().payload, b"payload");
+    }
+
     #[test]
     fn a_failed_write_leaves_an_existing_bundle_alone() {
         let key = keypair();
@@ -782,39 +817,48 @@ mod tests {
         let out = dir.join("x.aivyxpack");
         write_bundle(b"old payload", &key, &out).unwrap();
         let before = std::fs::read(&out).unwrap();
-        // A directory where the temp file goes makes the write fail after
-        // the signature has been made and checked.
-        std::fs::create_dir(dir.join(".x.aivyxpack.tmp")).unwrap();
-        let mut sign = |m: &[u8]| Ok(key.sign(m).to_bytes());
-        let err = write_bundle_with(b"new payload", &key.verifying_key(), &mut sign, &out);
+        // Something already at the temp path: `create_new` fails after the
+        // signature was made and checked, and nothing is removed.
+        let tmp = dir.join(".x.aivyxpack.taken.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        let (sig, publisher) = signed(&key, b"new payload");
+        let err = place_bundle(&tmp, &out, b"new payload", &sig, &publisher);
         assert!(matches!(err, Err(PackError::Io(_))), "{err:?}");
         assert_eq!(std::fs::read(&out).unwrap(), before, "the old bundle is untouched");
-        assert!(dir.join(".x.aivyxpack.tmp").is_dir(), "a directory is never removed");
+        assert!(tmp.is_dir(), "what was there is not removed");
     }
 
     #[test]
-    fn a_write_leaves_no_temp_file_and_replaces_a_stale_one() {
+    fn a_failed_rename_removes_only_its_own_temp_file() {
         let key = keypair();
-        let dir = tmpdir("with-stale-tmp");
+        let dir = tmpdir("with-failed-rename");
+        // `out` is a non-empty directory, so the rename fails after the
+        // temp file is written.
         let out = dir.join("x.aivyxpack");
-        std::fs::write(dir.join(".x.aivyxpack.tmp"), b"stale half-written bundle").unwrap();
-        write_bundle(b"payload", &key, &out).unwrap();
-        assert!(!dir.join(".x.aivyxpack.tmp").exists());
-        let bundle = read_bundle(&out).unwrap();
-        assert_eq!(bundle.payload, b"payload");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(out.join("keep"), b"keep").unwrap();
+        let tmp = bundle_temp_path(&out).unwrap();
+        let (sig, publisher) = signed(&key, b"payload");
+        assert!(place_bundle(&tmp, &out, b"payload", &sig, &publisher).is_err());
+        assert!(!tmp.exists(), "its own temp file is cleaned up");
+        assert_eq!(std::fs::read(out.join("keep")).unwrap(), b"keep");
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_symlink_at_the_temp_path_is_not_followed() {
+    fn a_symlink_at_the_temp_path_is_not_followed_or_removed() {
         let key = keypair();
         let dir = tmpdir("with-tmp-symlink");
         let victim = dir.join("victim");
         std::fs::write(&victim, b"keep me").unwrap();
-        std::os::unix::fs::symlink(&victim, dir.join(".x.aivyxpack.tmp")).unwrap();
-        write_bundle(b"payload", &key, &dir.join("x.aivyxpack")).unwrap();
+        let tmp = dir.join(".x.aivyxpack.planted.tmp");
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        let (sig, publisher) = signed(&key, b"payload");
+        let out = dir.join("x.aivyxpack");
+        assert!(place_bundle(&tmp, &out, b"payload", &sig, &publisher).is_err());
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
-        read_bundle(&dir.join("x.aivyxpack")).unwrap();
+        assert!(std::fs::symlink_metadata(&tmp).unwrap().file_type().is_symlink());
+        assert!(!out.exists());
     }
 
     #[test]
