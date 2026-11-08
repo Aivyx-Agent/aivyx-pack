@@ -15,8 +15,17 @@ share one implementation. See `README.md` for the format.
 
 ```sh
 cargo test
-cargo clippy --all-targets -- -D warnings
+cargo test --features test-util     # YubiKey code against aivyx-yubi's FakeCard
+cargo clippy --all-targets --all-features -- -D warnings
+cargo deny check
 ```
+
+The `yubikey` feature (`build --yubikey`, `yubikey-init`, `src/yubikey.rs`)
+needs `libpcsclite` to build; the default build must stay free of it
+(`cargo tree -e normal` shows no aivyx-yubi or pcsc). `test-util` adds
+aivyx-yubi's `FakeCard` for `tests/yubikey.rs` only. Never touch a real
+card from a test. Format new files with `rustfmt --edition 2024 <file>`;
+the older files are hand-formatted, so a whole-repo `cargo fmt` is churn.
 
 ## Rules
 

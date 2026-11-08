@@ -34,6 +34,8 @@ use thiserror::Error;
 mod config_pack;
 pub use config_pack::{CoderPart, ConfigPackManifest, PaPart, Product};
 pub mod describe;
+#[cfg(feature = "yubikey")]
+pub mod yubikey;
 
 /// Compiled-in Aivyx publisher verifying keys (base64), shared by every
 /// Aivyx product that installs packs. Empty until the
@@ -87,6 +89,8 @@ pub enum PackError {
     UntrustedPublisher { hint: String },
     #[error("signature verification FAILED — the bundle is corrupt or tampered")]
     BadSignature,
+    #[error("signer: {0}")]
+    Signer(String),
     #[error("payload has no {MANIFEST_NAME}")]
     MissingManifest,
     #[error("manifest is invalid: {0}")]
@@ -405,14 +409,25 @@ fn collect_files(dir: &Path, push: &mut dyn FnMut(&Path)) -> Result<(), PackErro
     Ok(())
 }
 
-/// Sign a payload and write the complete `.aivyxpack` bundle.
-pub fn write_bundle(
+/// A signing step for [`write_bundle_with`]: message in, Ed25519 signature
+/// out.
+pub type SignFn<'a> = dyn FnMut(&[u8]) -> Result<[u8; 64], PackError> + 'a;
+
+/// Sign a payload with any Ed25519 signer (a key file or a YubiKey) and
+/// write the bundle. The signature is checked against `public_key` before
+/// anything is written, so a wrong card or a bad signer can never produce a
+/// bundle that won't verify, and a failed signature leaves no file behind.
+pub fn write_bundle_with(
     payload: &[u8],
-    signing_key: &SigningKey,
+    public_key: &VerifyingKey,
+    sign: &mut SignFn<'_>,
     out: &Path,
 ) -> Result<(), PackError> {
-    let signature = signing_key.sign(payload);
-    let publisher = encode_verifying_key(&signing_key.verifying_key());
+    let signature = Signature::from_bytes(&sign(payload)?);
+    public_key
+        .verify(payload, &signature)
+        .map_err(|_| PackError::BadSignature)?;
+    let publisher = encode_verifying_key(public_key);
 
     let file = std::fs::File::create(out)?;
     let mut tarb = tar::Builder::new(file);
@@ -430,6 +445,16 @@ pub fn write_bundle(
     }
     tarb.into_inner()?.sync_all()?;
     Ok(())
+}
+
+/// Sign a payload and write the complete `.aivyxpack` bundle.
+pub fn write_bundle(
+    payload: &[u8],
+    signing_key: &SigningKey,
+    out: &Path,
+) -> Result<(), PackError> {
+    let mut sign = |m: &[u8]| Ok(signing_key.sign(m).to_bytes());
+    write_bundle_with(payload, &signing_key.verifying_key(), &mut sign, out)
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +691,43 @@ mod tests {
 
     fn keypair() -> SigningKey {
         SigningKey::generate(&mut OsRng)
+    }
+
+    #[test]
+    fn write_bundle_with_matches_write_bundle() {
+        let key = keypair();
+        let dir = tmpdir("with-matches");
+        let payload = b"payload bytes".to_vec();
+        let a = dir.join("a.aivyxpack");
+        let b = dir.join("b.aivyxpack");
+        write_bundle(&payload, &key, &a).unwrap();
+        let mut sign = |m: &[u8]| Ok(key.sign(m).to_bytes());
+        write_bundle_with(&payload, &key.verifying_key(), &mut sign, &b).unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+        let bundle = read_bundle(&b).unwrap();
+        verify_bundle(&bundle, &[encode_verifying_key(&key.verifying_key())]).unwrap();
+    }
+
+    #[test]
+    fn a_signature_that_does_not_verify_is_refused_before_writing() {
+        let key = keypair();
+        let dir = tmpdir("with-bad-sig");
+        let out = dir.join("x.aivyxpack");
+        let mut sign = |_: &[u8]| Ok([0u8; 64]);
+        let err = write_bundle_with(b"p", &key.verifying_key(), &mut sign, &out).unwrap_err();
+        assert!(matches!(err, PackError::BadSignature));
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn a_signer_error_is_passed_through_before_writing() {
+        let key = keypair();
+        let dir = tmpdir("with-signer-err");
+        let out = dir.join("x.aivyxpack");
+        let mut sign = |_: &[u8]| Err(PackError::Signer("card removed".into()));
+        let err = write_bundle_with(b"p", &key.verifying_key(), &mut sign, &out).unwrap_err();
+        assert!(matches!(err, PackError::Signer(ref m) if m == "card removed"));
+        assert!(!out.exists());
     }
 
     fn tmpdir(tag: &str) -> PathBuf {

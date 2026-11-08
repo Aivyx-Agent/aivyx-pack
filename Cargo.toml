@@ -19,3 +19,22 @@ serde = { version = "1", features = ["derive"] }
 tar = "0.4"
 thiserror = "2"
 toml = "0.8"
+# YubiKey signing (`build --yubikey`, `yubikey-init`). Off by default: it
+# needs libpcsclite at build time, and the default build must stay free of
+# hardware dependencies.
+aivyx-yubi = { git = "https://github.com/Aivyx-Agent/aivyx-yubi", rev = "6dce9d40aa2698a36bbc62d18359a21a8ba79c9e", optional = true }
+# Same version aivyx-yubi 6dce9d4 uses; needed to name `Card<Transaction>`
+# in `yubikey::init_card`'s signature (aivyx-yubi does not re-export it).
+openpgp-card = { version = "0.7", optional = true }
+rpassword = { version = "7", optional = true }
+
+[features]
+yubikey = ["dep:aivyx-yubi", "dep:openpgp-card", "dep:rpassword"]
+# Turns on aivyx-yubi's `FakeCard` for `tests/yubikey.rs`. Separate from
+# `yubikey` so a release binary never links the fake card backend:
+# `cargo test --features test-util`.
+test-util = ["yubikey", "aivyx-yubi/test-util"]
+
+[[test]]
+name = "yubikey"
+required-features = ["test-util"]

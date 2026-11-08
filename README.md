@@ -65,11 +65,33 @@ are packed.
 ```
 aivyx-pack keygen <keyfile>                              # new signing key (secret, 0600)
 aivyx-pack build <staging-dir> --key <keyfile> --out <file>
+aivyx-pack build <staging-dir> --yubikey [--serial <serial>] --out <file>
+aivyx-pack yubikey-init [--serial <serial>]               # put a pack key on a YubiKey
 aivyx-pack inspect <file> [--trust <base64-key>]... [--allow-untrusted]
 ```
 
 `build` checks the manifest and that every file it names exists before
-signing. Users install packs with their product's own command
+signing.
+
+### Signing on a YubiKey
+
+Build with `cargo build --release --features yubikey` (needs `libpcsclite`
+to build and `pcscd` running to use). Then the publisher key can live only
+in hardware, in the Signature slot of a YubiKey's OpenPGP applet:
+
+- `yubikey-init` generates an Ed25519 key on the card and prints its
+  verifying key. It refuses a card whose PINs are still the factory
+  defaults or whose PIN retry counters are below maximum (it never changes
+  a PIN), asks you to type the card serial back before overwriting a key
+  already in the slot, sets the touch policy to fixed, and ends by signing
+  a test message and checking it.
+- `build --yubikey` asks for the user PIN and signs on the card (touch it
+  when asked). The signature is checked before the bundle is written, so a
+  wrong card or a pulled card leaves no file.
+
+A card has one Signature slot. A card that holds a pack key must hold only
+that key: never put `aivyx-pa`'s federation identity key on the same card.
+Without the feature, `--yubikey` and `yubikey-init` exit 2 and say so. Users install packs with their product's own command
 (`aivyx-pa pack install`, `aivyx-coder pack install`).
 
 ## Using the crate

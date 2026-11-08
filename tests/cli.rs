@@ -94,3 +94,31 @@ fn unknown_command_prints_usage() {
     let out = bin().args(["build", "x", "--key", "k"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2), "missing --out is a usage error");
 }
+
+#[test]
+fn build_takes_one_signer() {
+    let both = bin().args(["build", "x", "--key", "k", "--yubikey", "--out", "o"]).output().unwrap();
+    assert_eq!(both.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&both.stderr).contains("not both"));
+    let neither = bin().args(["build", "x", "--out", "o"]).output().unwrap();
+    assert_eq!(neither.status.code(), Some(2));
+    let serial = bin().args(["build", "x", "--key", "k", "--serial", "1", "--out", "o"]).output();
+    assert_eq!(serial.unwrap().status.code(), Some(2), "--serial needs --yubikey");
+}
+
+#[cfg(not(feature = "yubikey"))]
+#[test]
+fn yubikey_commands_need_the_feature() {
+    let no_support =
+        "this aivyx-pack was built without YubiKey support (cargo build --features yubikey)";
+    for args in [
+        &["build", "x", "--yubikey", "--out", "o"][..],
+        &["build", "x", "--yubikey", "--serial", "1", "--out", "o"][..],
+        &["yubikey-init"][..],
+        &["yubikey-init", "--serial", "1"][..],
+    ] {
+        let out = bin().args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains(no_support), "{args:?}");
+    }
+}
