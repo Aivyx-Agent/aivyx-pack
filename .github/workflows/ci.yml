@@ -19,6 +19,18 @@ jobs:
           components: clippy
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
+  yubikey:
+    # The `yubikey` feature links libpcsclite. Tests use aivyx-yubi's
+    # FakeCard (feature test-util); no real card is involved.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo test --features test-util
+      - run: cargo clippy --all-targets --all-features -- -D warnings
   deny:
     runs-on: ubuntu-latest
     steps:
