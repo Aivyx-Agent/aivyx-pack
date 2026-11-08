@@ -116,6 +116,7 @@ fn yubikey_commands_need_the_feature() {
         &["build", "x", "--yubikey", "--serial", "1", "--out", "o"][..],
         &["yubikey-init"][..],
         &["yubikey-init", "--serial", "1"][..],
+        &["yubikey-init", "--overwrite-existing-key", "--serial", "1"][..],
     ] {
         let out = bin().args(args).output().unwrap();
         assert_eq!(out.status.code(), Some(2), "{args:?}");

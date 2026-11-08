@@ -66,12 +66,13 @@ are packed.
 aivyx-pack keygen <keyfile>                              # new signing key (secret, 0600)
 aivyx-pack build <staging-dir> --key <keyfile> --out <file>
 aivyx-pack build <staging-dir> --yubikey [--serial <serial>] --out <file>
-aivyx-pack yubikey-init [--serial <serial>]               # put a pack key on a YubiKey
+aivyx-pack yubikey-init [--serial <serial>] [--overwrite-existing-key]   # put a pack key on a YubiKey
 aivyx-pack inspect <file> [--trust <base64-key>]... [--allow-untrusted]
 ```
 
 `build` checks the manifest and that every file it names exists before
-signing.
+signing. Users install packs with their product's own command
+(`aivyx-pa pack install`, `aivyx-coder pack install`).
 
 ### Signing on a YubiKey
 
@@ -82,17 +83,19 @@ in hardware, in the Signature slot of a YubiKey's OpenPGP applet:
 - `yubikey-init` generates an Ed25519 key on the card and prints its
   verifying key. It refuses a card whose PINs are still the factory
   defaults or whose PIN retry counters are below maximum (it never changes
-  a PIN), asks you to type the card serial back before overwriting a key
-  already in the slot, sets the touch policy to fixed, and ends by signing
-  a test message and checking it.
+  a PIN). It refuses a card whose Signature slot already holds a key
+  unless you pass `--overwrite-existing-key` and then type the card serial
+  back. It sets the touch policy to fixed and ends by signing a test
+  message and checking it; if that check fails (say, a mistyped User PIN),
+  the card is re-keyed anyway, so it still prints the new verifying key and
+  tells you to check the PIN retry counter with `gpg --card-status`.
 - `build --yubikey` asks for the user PIN and signs on the card (touch it
   when asked). The signature is checked before the bundle is written, so a
   wrong card or a pulled card leaves no file.
 
 A card has one Signature slot. A card that holds a pack key must hold only
 that key: never put `aivyx-pa`'s federation identity key on the same card.
-Without the feature, `--yubikey` and `yubikey-init` exit 2 and say so. Users install packs with their product's own command
-(`aivyx-pa pack install`, `aivyx-coder pack install`).
+Without the feature, `--yubikey` and `yubikey-init` exit 2 and say so.
 
 ## Using the crate
 

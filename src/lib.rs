@@ -35,6 +35,7 @@ mod config_pack;
 pub use config_pack::{CoderPart, ConfigPackManifest, PaPart, Product};
 pub mod describe;
 #[cfg(feature = "yubikey")]
+#[doc(hidden)]
 pub mod yubikey;
 
 /// Compiled-in Aivyx publisher verifying keys (base64), shared by every

@@ -13,8 +13,18 @@
 //! One card holds one Signature-slot key. A card provisioned for packs
 //! must hold only the pack key: never `aivyx-pa`'s federation identity
 //! key, which uses the same slot.
+//!
+//! **This is the CLI's internals, not a stable API** (hence
+//! `#[doc(hidden)]`). These functions do not run the CLI's guards on their
+//! own: a caller must still require `--overwrite-existing-key` and the
+//! typed serial before overwriting a key ([`confirm_overwrite`]), and must
+//! close the provisioning transaction and its card before opening a
+//! `YubiKeySigner` (finding C-1 in `aivyx-pa`'s `federation.rs`). Use the
+//! `aivyx-pack` command.
 
 use std::path::Path;
+
+use base64::Engine as _;
 
 use aivyx_yubi::{SecretString, YubiError, discovery, pin, provision};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -103,6 +113,48 @@ pub fn slot_state(has_key: bool) -> &'static str {
     }
 }
 
+/// The flag that allows `yubikey-init` to overwrite an occupied slot.
+pub const OVERWRITE_FLAG: &str = "--overwrite-existing-key";
+
+/// Whether `yubikey-init` may overwrite `card`'s Signature slot, ported
+/// from `aivyx-pa`'s `federation yubikey-init`: an empty slot needs
+/// nothing (`Ok(false)`). An occupied one needs both
+/// `--overwrite-existing-key` (`overwrite_flag`) and the operator typing
+/// the card serial back at an interactive terminal (`read_typed`, called
+/// only when both of the others hold); then `Ok(true)`. Anything else is
+/// refused before any PIN is asked for.
+pub fn confirm_overwrite(
+    card: &discovery::CardSummary,
+    overwrite_flag: bool,
+    interactive: bool,
+    read_typed: &mut dyn FnMut() -> Result<String, String>,
+) -> Result<bool, PackError> {
+    if !card.has_signature_key {
+        return Ok(false);
+    }
+    let serial = &card.serial;
+    if !overwrite_flag {
+        return Err(PackError::Signer(format!(
+            "card {serial}'s Signature slot already holds a key: refusing to overwrite it (it \
+             may be a GPG signing key or aivyx-pa's federation identity key). Run again with \
+             {OVERWRITE_FLAG} once you are sure that key may be destroyed."
+        )));
+    }
+    if !interactive {
+        return Err(PackError::Signer(format!(
+            "{OVERWRITE_FLAG} needs an interactive terminal to confirm card {serial}'s serial: \
+             refusing"
+        )));
+    }
+    let typed = read_typed().map_err(PackError::Signer)?;
+    if !typed_serial_confirms_overwrite(serial, &typed) {
+        return Err(PackError::Signer(
+            "that is not the card's serial: stopping without touching the card".into(),
+        ));
+    }
+    Ok(true)
+}
+
 /// The overwrite confirmation: the operator typed the card's serial back
 /// exactly (surrounding whitespace, such as the newline, ignored).
 pub fn typed_serial_confirms_overwrite(expected_serial: &str, typed: &str) -> bool {
@@ -123,7 +175,8 @@ pub struct Provisioned {
 /// `federation yubikey-init` with every guard it has.
 ///
 /// - An occupied Signature slot is refused unless `overwrite_confirmed`
-///   (the CLI sets it only after the operator typed the card serial back).
+///   (the CLI sets it only from [`confirm_overwrite`]: the flag plus the
+///   typed serial).
 ///   Checked again here, on the open card, not only from the earlier
 ///   listing.
 /// - PINs: [`pin::require_pin_changed`], called exactly once. It refuses a
@@ -149,11 +202,11 @@ pub fn init_card(
 
     let occupied = provision::signature_slot_has_key(tx).map_err(fail)?;
     if occupied && !overwrite_confirmed {
-        return Err(PackError::Signer(
+        return Err(PackError::Signer(format!(
             "this card's Signature slot already holds a key: refusing to overwrite it \
-             (it may be a GPG signing key or aivyx-pa's federation identity key)"
-                .into(),
-        ));
+                 (it may be a GPG signing key or aivyx-pa's federation identity key) without \
+                 {OVERWRITE_FLAG} and the typed serial"
+        )));
     }
 
     pin::require_pin_changed(tx).map_err(|e| {
@@ -244,6 +297,30 @@ pub fn check_provisioned(
         })
 }
 
+/// The base64 form of a card public key, as `encode_verifying_key` prints
+/// it (raw bytes, so it works even for a key that is not a valid point).
+pub fn encode_card_key(public_key: &[u8; 32]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(public_key)
+}
+
+/// `yubikey-init`'s message when the closing check fails after the card
+/// was re-keyed: the card holds the new key either way, so its verifying
+/// key is printed, with a warning about the User PIN retries already used.
+pub fn closing_check_failed(provisioned: &Provisioned, error: &str) -> String {
+    format!(
+        "card {serial} WAS provisioned (its old Signature-slot key is gone), but the closing \
+         check failed: {error}\n\
+         new verifying key: {key}\n\
+         Warning: the factory-default PIN check already used one User PIN retry, and a \
+         mistyped User PIN in this check used another. Check the counter with \
+         `gpg --card-status` before trying again: a blocked User PIN needs the Admin PIN to \
+         reset. To check the card again without re-keying it, sign a test pack with \
+         `aivyx-pack build <staging-dir> --yubikey --serial {serial} --out <file>`.",
+        serial = provisioned.card_serial,
+        key = encode_card_key(&provisioned.public_key),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +364,49 @@ mod tests {
             "0006:0011223\n"
         ));
         assert!(!typed_serial_confirms_overwrite("0006:00112233", ""));
+    }
+
+    #[test]
+    fn confirm_overwrite_needs_the_flag_a_terminal_and_the_serial() {
+        let empty = card("0006:00112233", false);
+        let full = card("0006:00112233", true);
+        let mut never = || -> Result<String, String> { panic!("must not prompt") };
+        assert!(!confirm_overwrite(&empty, false, false, &mut never).unwrap());
+
+        let err = confirm_overwrite(&full, false, true, &mut never)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(OVERWRITE_FLAG), "{err}");
+        let err = confirm_overwrite(&full, true, false, &mut never)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("interactive terminal"), "{err}");
+
+        let mut wrong = || Ok("yes\n".to_string());
+        assert!(confirm_overwrite(&full, true, true, &mut wrong).is_err());
+        let mut right = || Ok("0006:00112233\n".to_string());
+        assert!(confirm_overwrite(&full, true, true, &mut right).unwrap());
+    }
+
+    #[test]
+    fn the_closing_check_failure_names_the_new_key_and_the_retries() {
+        let p = Provisioned {
+            card_serial: "0006:00112233".into(),
+            public_key: [5; 32],
+        };
+        let text = closing_check_failed(&p, "PIN incorrect");
+        assert!(text.contains(&encode_card_key(&[5; 32])), "{text}");
+        assert!(text.contains("gpg --card-status"), "{text}");
+        assert!(text.contains("PIN incorrect"), "{text}");
+    }
+
+    #[test]
+    fn encode_card_key_matches_encode_verifying_key() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]).verifying_key();
+        assert_eq!(
+            encode_card_key(&key.to_bytes()),
+            crate::encode_verifying_key(&key)
+        );
     }
 
     #[test]

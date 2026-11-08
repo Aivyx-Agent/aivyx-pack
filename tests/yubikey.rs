@@ -10,7 +10,10 @@
 use std::path::PathBuf;
 
 use aivyx_pack::PackError;
-use aivyx_pack::yubikey::{Provisioned, check_provisioned, init_card, write_bundle_on_card};
+use aivyx_pack::yubikey::{
+    OVERWRITE_FLAG, Provisioned, check_provisioned, closing_check_failed, confirm_overwrite,
+    encode_card_key, init_card, write_bundle_on_card,
+};
 use aivyx_yubi::testing::FakeCard;
 use aivyx_yubi::{SecretString, YubiError};
 use ed25519_dalek::SigningKey;
@@ -209,4 +212,61 @@ fn the_closing_check_fails_on_the_fake_cards_signature() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("not a valid Ed25519"), "{err}");
+}
+
+/// What `yubikey-init` sees for `fake`: its entry in the card listing.
+fn summary(fake: &FakeCard) -> aivyx_yubi::discovery::CardSummary {
+    let backends = std::iter::once(Ok(fake.clone().into()));
+    let mut cards = aivyx_yubi::discovery::list_cards_from(backends).unwrap();
+    assert_eq!(cards.len(), 1);
+    cards.remove(0)
+}
+
+#[test]
+fn overwriting_an_occupied_slot_needs_the_flag_and_the_typed_serial() {
+    let fake = changed_pins();
+    assert!(!summary(&fake).has_signature_key);
+    let mut never = || -> Result<String, String> { panic!("must not prompt") };
+    assert!(!confirm_overwrite(&summary(&fake), false, false, &mut never).unwrap());
+
+    init(&fake, false).0.unwrap();
+    fake_sign(&fake, b"test").unwrap(); // restores the User PIN retry the probe used
+    let card = summary(&fake);
+    assert!(card.has_signature_key);
+
+    // No flag: refused, naming the flag, before any prompt.
+    let err = confirm_overwrite(&card, false, true, &mut never)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(OVERWRITE_FLAG), "{err}");
+    // Flag but no terminal: refused.
+    assert!(confirm_overwrite(&card, true, false, &mut never).is_err());
+    // Flag and a wrong serial: refused.
+    let mut wrong = || Ok("0006:99999999\n".to_string());
+    assert!(confirm_overwrite(&card, true, true, &mut wrong).is_err());
+    // init_card itself still refuses without the confirmation, naming the flag.
+    let (result, asked) = init(&fake, false);
+    assert!(result.unwrap_err().to_string().contains(OVERWRITE_FLAG));
+    assert_eq!(asked, 0);
+
+    // Flag and the right serial: confirmed, and init_card overwrites.
+    let mut right = || Ok(format!("{}\n", card.serial));
+    let confirmed = confirm_overwrite(&card, true, true, &mut right).unwrap();
+    assert!(confirmed);
+    let (result, asked) = init(&fake, confirmed);
+    assert_eq!(result.unwrap().public_key, FakeCard::fake_public_key());
+    assert_eq!(asked, 1);
+}
+
+#[test]
+fn a_failed_closing_check_still_prints_the_new_key() {
+    let fake = changed_pins();
+    let provisioned = init(&fake, false).0.unwrap();
+    let text = closing_check_failed(&provisioned, "PIN incorrect");
+    assert!(
+        text.contains(&encode_card_key(&FakeCard::fake_public_key())),
+        "{text}"
+    );
+    assert!(text.contains("WAS provisioned"), "{text}");
+    assert!(text.contains("gpg --card-status"), "{text}");
 }

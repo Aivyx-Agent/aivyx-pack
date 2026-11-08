@@ -15,7 +15,7 @@ const USAGE: &str = "usage:
   aivyx-pack keygen <keyfile>
   aivyx-pack build <staging-dir> --key <keyfile> --out <file>
   aivyx-pack build <staging-dir> --yubikey [--serial <serial>] --out <file>
-  aivyx-pack yubikey-init [--serial <serial>]
+  aivyx-pack yubikey-init [--serial <serial>] [--overwrite-existing-key]
   aivyx-pack inspect <file> [--trust <base64-key>]... [--allow-untrusted]";
 
 const NO_YUBIKEY: &str =
@@ -33,7 +33,7 @@ enum Signer {
 enum Command {
     Keygen { keyfile: String },
     Build { staging: String, signer: Signer, out: String },
-    YubikeyInit { serial: Option<String> },
+    YubikeyInit { serial: Option<String>, overwrite_existing_key: bool },
     Inspect { file: String, trust: Vec<String>, allow_untrusted: bool },
     Help,
 }
@@ -85,9 +85,19 @@ fn parse(args: &[String]) -> Result<Command, String> {
                 out: out.ok_or("build needs --out <file>")?,
             })
         }
-        ["yubikey-init"] => Ok(Command::YubikeyInit { serial: None }),
-        ["yubikey-init", "--serial", serial] => {
-            Ok(Command::YubikeyInit { serial: Some(serial.to_string()) })
+        ["yubikey-init", rest @ ..] => {
+            let (mut serial, mut overwrite_existing_key) = (None, false);
+            let mut it = rest.iter();
+            while let Some(flag) = it.next() {
+                match *flag {
+                    "--serial" => {
+                        serial = Some(it.next().ok_or("--serial needs a value")?.to_string())
+                    }
+                    "--overwrite-existing-key" => overwrite_existing_key = true,
+                    other => return Err(format!("unknown option {other}")),
+                }
+            }
+            Ok(Command::YubikeyInit { serial, overwrite_existing_key })
         }
         ["inspect", file, rest @ ..] => {
             let (mut trust, mut allow_untrusted) = (Vec::new(), false);
@@ -144,7 +154,9 @@ fn run(cmd: Command) -> Result<(), String> {
             );
         }
         #[cfg(feature = "yubikey")]
-        Command::YubikeyInit { serial } => yubikey::init(serial.as_deref())?,
+        Command::YubikeyInit { serial, overwrite_existing_key } => {
+            yubikey::init(serial.as_deref(), overwrite_existing_key)?
+        }
         #[cfg(not(feature = "yubikey"))]
         Command::YubikeyInit { .. } => return Err(NO_YUBIKEY.into()),
         Command::Inspect { file, trust, allow_untrusted } => {
@@ -195,8 +207,8 @@ mod yubikey {
 
     use aivyx_pack::encode_verifying_key;
     use aivyx_pack::yubikey::{
-        check_provisioned, choose_card, init_card, slot_state, typed_serial_confirms_overwrite,
-        write_bundle_on_card,
+        check_provisioned, choose_card, closing_check_failed, confirm_overwrite, encode_card_key,
+        init_card, slot_state, write_bundle_on_card,
     };
     use aivyx_yubi::{SecretString, YubiError, YubiKeySigner, discovery};
 
@@ -229,7 +241,7 @@ mod yubikey {
 
     /// `yubikey-init [--serial S]`: provision a card's Signature slot for
     /// pack signing. Ported from `aivyx-pa`'s `federation yubikey-init`.
-    pub fn init(serial: Option<&str>) -> Result<(), String> {
+    pub fn init(serial: Option<&str>, overwrite_existing_key: bool) -> Result<(), String> {
         let say = |line: &str| eprintln!("aivyx-pack yubikey-init: {line}");
         say(
             "this card's Signature slot will hold only this pack key. Never use it for \
@@ -249,32 +261,28 @@ mod yubikey {
         let chosen_serial = chosen.serial.clone();
         say(&format!("using card {chosen_serial}"));
 
-        // An occupied slot is overwritten only after the operator types the
-        // serial back, at a real terminal. Asked before any PIN is.
-        let overwrite_confirmed = chosen.has_signature_key;
-        if chosen.has_signature_key {
-            if !io::stdin().is_terminal() {
-                return Err(format!(
-                    "card {chosen_serial}'s Signature slot already holds a key; overwriting it \
-                     needs an interactive terminal to confirm the serial: refusing"
-                ));
-            }
-            eprint!(
-                "aivyx-pack yubikey-init: card {chosen_serial}'s Signature slot already holds a \
-                 key (it may be a GPG signing key, or aivyx-pa's federation identity key). \
-                 Provisioning PERMANENTLY DESTROYS it. Type the card's serial to confirm: "
-            );
-            io::stderr().flush().map_err(|e| e.to_string())?;
-            let mut typed = String::new();
-            io::stdin()
-                .read_line(&mut typed)
-                .map_err(|e| format!("could not read the confirmation: {e}"))?;
-            if !typed_serial_confirms_overwrite(&chosen_serial, &typed) {
-                return Err(
-                    "that is not the card's serial: stopping without touching the card".into(),
+        // An occupied slot is overwritten only with --overwrite-existing-key
+        // and the serial typed back at a real terminal. Asked before any PIN.
+        let overwrite_confirmed = confirm_overwrite(
+            chosen,
+            overwrite_existing_key,
+            io::stdin().is_terminal(),
+            &mut || {
+                eprint!(
+                    "aivyx-pack yubikey-init: card {chosen_serial}'s Signature slot already \
+                     holds a key (it may be a GPG signing key, or aivyx-pa's federation identity \
+                     key). Provisioning PERMANENTLY DESTROYS it. Type the card's serial to \
+                     confirm: "
                 );
-            }
-        }
+                io::stderr().flush().map_err(|e| e.to_string())?;
+                let mut typed = String::new();
+                io::stdin()
+                    .read_line(&mut typed)
+                    .map_err(|e| format!("could not read the confirmation: {e}"))?;
+                Ok(typed)
+            },
+        )
+        .map_err(|e| e.to_string())?;
 
         let mut card =
             discovery::discover_real_card_by_serial(&chosen_serial).map_err(|e| e.to_string())?;
@@ -301,24 +309,21 @@ mod yubikey {
             "provisioned card {}; checking it with a test signature...",
             provisioned.card_serial
         ));
-        let pin = prompt_pin("User PIN (input hidden, for the test signature): ")?;
-        let signer = open_signer(pin, Some(&provisioned.card_serial))?;
-        say("touch the YubiKey to sign the test message…");
-        check_provisioned(&provisioned, &signer.public_key(), &mut |m| signer.sign(m)).map_err(
-            |e| {
-                format!(
-                    "card {} was provisioned, but the closing check failed: {e}",
-                    provisioned.card_serial
-                )
-            },
-        )?;
+        // The card is re-keyed by now: if this check fails, still print the
+        // new key, and warn about the User PIN retries already used.
+        let checked = (|| {
+            let pin = prompt_pin("User PIN (input hidden, for the test signature): ")?;
+            let signer = open_signer(pin, Some(&provisioned.card_serial))?;
+            say("touch the YubiKey to sign the test message…");
+            check_provisioned(&provisioned, &signer.public_key(), &mut |m| signer.sign(m))
+                .map_err(|e| e.to_string())
+        })();
+        checked.map_err(|e| closing_check_failed(&provisioned, &e))?;
 
-        let key = aivyx_pack::yubikey::card_verifying_key(&provisioned.public_key)
-            .map_err(|e| e.to_string())?;
         say("the test signature verifies (the touch policy is fixed: it needed a touch).");
         println!("card serial: {}", provisioned.card_serial);
         println!("verifying key (users trust packs signed with it):");
-        println!("  {}", encode_verifying_key(&key));
+        println!("  {}", encode_card_key(&provisioned.public_key));
         println!(
             "this card now holds this pack key in its Signature slot. Keep it for packs \
              only: never provision aivyx-pa's federation identity key on it."
