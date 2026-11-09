@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use aivyx_pack::PackError;
 use aivyx_pack::yubikey::{
     OVERWRITE_FLAG, Provisioned, check_provisioned, closing_check_failed, confirm_overwrite,
-    encode_card_key, init_card, write_bundle_on_card,
+    encode_card_key, init_card, sign_hub_index_on_card, write_bundle_on_card,
 };
 use aivyx_yubi::testing::FakeCard;
 use aivyx_yubi::{SecretString, YubiError};
@@ -269,4 +269,23 @@ fn a_failed_closing_check_still_prints_the_new_key() {
     );
     assert!(text.contains("WAS provisioned"), "{text}");
     assert!(text.contains("gpg --card-status"), "{text}");
+}
+
+#[test]
+fn hub_sign_on_a_card_signs_the_prefixed_index_and_writes_nothing_that_does_not_verify() {
+    // `hub-sign --yubikey`: the card is asked to sign the domain-separated
+    // index message, never the bare index bytes; FakeCard's signature does
+    // not verify, so no index.json.sig is written.
+    let fake = changed_pins();
+    init(&fake, false).0.unwrap();
+    let hub = tempdir("hub-sign");
+    std::fs::create_dir_all(hub.join("packs")).unwrap();
+    let index = br#"{"schema_version": 2, "packs": []}"#;
+    std::fs::write(hub.join("packs/index.json"), index).unwrap();
+    let named_key = SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes();
+    let mut sign = |m: &[u8]| fake_sign(&fake, m);
+    let err = sign_hub_index_on_card(&hub, &named_key, &mut sign).unwrap_err();
+    assert!(matches!(err, PackError::BadSignature), "{err}");
+    assert_eq!(fake.last_signed_data(), aivyx_pack::hub::hub_index_message(index));
+    assert!(!hub.join("packs/index.json.sig").exists());
 }

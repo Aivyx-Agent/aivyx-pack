@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{PackError, check_name, safe_relative, semverish};
 
 /// The product a part is for.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Product {
     Pa,

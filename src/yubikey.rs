@@ -63,6 +63,20 @@ pub fn write_bundle_on_card(
     Ok(key)
 }
 
+/// Sign a Hub's `packs/index.json` on a card and write
+/// `packs/index.json.sig` ([`crate::hub::sign_hub_index_with`]: checked
+/// before writing, temp file plus rename). Returns the card's verifying key.
+pub fn sign_hub_index_on_card(
+    hub: &Path,
+    public_key: &[u8; 32],
+    sign: &mut CardSignFn<'_>,
+) -> Result<VerifyingKey, PackError> {
+    let key = card_verifying_key(public_key)?;
+    let mut sign = |m: &[u8]| sign(m).map_err(|e| PackError::Signer(e.to_string()));
+    crate::hub::sign_hub_index_with(hub, &key, &mut sign)?;
+    Ok(key)
+}
+
 /// Pick the card `yubikey-init` provisions from the attached cards. With
 /// `--serial`, the card with that serial; without it, the only card
 /// attached (several attached is refused, so the wrong card is never

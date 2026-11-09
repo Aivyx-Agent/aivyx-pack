@@ -76,6 +76,10 @@ aivyx-pack build <staging-dir> --key <keyfile> --out <file>
 aivyx-pack build <staging-dir> --yubikey [--serial <serial>] --out <file>
 aivyx-pack yubikey-init [--serial <serial>] [--overwrite-existing-key]   # put a pack key on a YubiKey
 aivyx-pack inspect <file> [--trust <base64-key>]... [--allow-untrusted]
+aivyx-pack hub-check <hub-public-dir> [--trust <base64-key>]... [--allow-placeholders]
+                     [--require-signature] [--site-dist <dir>]
+aivyx-pack hub-sign <hub-public-dir> --key <keyfile>
+aivyx-pack hub-sign <hub-public-dir> --yubikey [--serial <serial>]
 ```
 
 `build` checks the manifest and that every file it names exists before
@@ -104,6 +108,104 @@ in hardware, in the Signature slot of a YubiKey's OpenPGP applet:
 A card has one Signature slot. A card that holds a pack key must hold only
 that key: never put `aivyx-pa`'s federation identity key on the same card.
 Without the feature, `--yubikey` and `yubikey-init` exit 2 and say so.
+
+## The Hub: `hub-check` and `hub-sign`
+
+The Aivyx Hub serves packs from a public folder laid out like this:
+
+```
+publisher-key.txt          # the publisher's verifying keys
+packs/index.json           # the manifest, schema 2
+packs/index.json.sig       # its detached signature (optional until required)
+packs/<name>-<version>.aivyxpack
+```
+
+`packs/index.json` (the `aivyx_pack::hub` module holds its types; unknown
+fields are refused):
+
+```json
+{
+  "schema_version": 2,
+  "packs": [
+    {
+      "name": "business-manager",
+      "display_name": "Business Manager",
+      "version": "0.1.0",
+      "description": "…",
+      "license": "free",
+      "format": 2,
+      "products": ["pa", "coder"],
+      "min_version": { "pa": "1.0.0", "coder": "1.0.0" },
+      "file": "business-manager-0.1.0.aivyxpack",
+      "size": 12345,
+      "sha256": "<64 lowercase hex>"
+    }
+  ]
+}
+```
+
+- `file` is a plain file name, exactly `<name>-<version>.aivyxpack`, next to
+  `index.json`: a client fetches the manifest's URL directory plus `file`.
+  There is no download URL.
+- `min_version` has a key for each product in `products`, and no other.
+- A format 1 entry has `"products": ["pa"]` and, instead of `file`, `size`
+  and `sha256`, a `targets` list of `{ "target", "file", "size", "sha256" }`
+  with `file` = `<name>-<version>-<target>.aivyxpack`.
+
+`publisher-key.txt` holds `#` comment lines (say which card holds each key),
+blank lines, and one base64 Ed25519 verifying key per other line:
+
+```
+# primary — YubiKey serial <serial>
+<base64 verifying key>
+# backup — YubiKey serial <serial>, sealed
+<base64 verifying key>
+```
+
+**`hub-check <dir>`** exits 1 and prints one line per problem, each starting
+with `✗`, or ends with `✓ hub ok: N packs` (`, index signed` when the
+signature verified). It checks that:
+
+- the manifest parses as schema 2, and every field is well formed;
+- nothing in it contains `PLACEHOLDER` (any case);
+- each listed bundle exists, has the listed size and sha256, is signed by a
+  built-in publisher key (`AIVYX_PUBLISHER_KEYS`; `--trust` adds one), and
+  its signed manifest agrees with the entry on name, version, format,
+  products and each `min_version` (and target, for format 1);
+- every `.aivyxpack` in `packs/` is listed;
+- `publisher-key.txt` has at least one key, every key line is a valid key,
+  and, once `AIVYX_PUBLISHER_KEYS` is filled, its keys are exactly that list;
+- `packs/index.json.sig`, if present, verifies against a key in
+  `publisher-key.txt`. `--require-signature` makes its absence a problem.
+
+`--allow-placeholders` turns placeholders into `! warning:` lines, for
+pre-launch builds: an entry with a placeholder skips its other checks, and a
+placeholder `publisher-key.txt` is accepted only while
+`AIVYX_PUBLISHER_KEYS` is empty.
+
+`--site-dist <dir>` also scans every `.html` file under the built site (often
+the same folder) for what the Hub's Content-Security-Policy
+(`script-src 'self'; style-src 'self'`) would break and for leaks: a
+`<script>` without `src`, a `<style>` element or a `style="…"` attribute, and
+any attribute linking `github.com/Aivyx-Agent/<private repo>` (aivyx-hub,
+aivyx-verticals, aivyx-ecosystem, aivyx-website, aivyx-brand,
+aivyx-wallpapers, aivyx-coder-bench, aivyx-coder-samples, aivyx-deploy; any
+case, `www.` or not). Each line names the file, the line and an excerpt.
+Comments are skipped.
+
+**`hub-sign <dir>`** signs the exact bytes of `packs/index.json` and writes
+the base64 signature to `packs/index.json.sig`. The index must parse as
+schema 2. As with bundles, the signature is checked before anything is
+written, and the file goes through a temp file and a rename. `--yubikey`
+signs on the card (the `yubikey` feature; same PIN prompt and touch as
+`build --yubikey`).
+
+The signed message is `b"aivyx-hub-index-v1\0"` followed by the index bytes,
+never the bare index: a bundle signature is over raw payload bytes, so the
+prefix keeps one kind of signature from ever passing as the other. A client
+that reads the manifest should verify it the same way
+(`aivyx_pack::hub::verify_hub_index`) and refuse a lower version than the one
+installed.
 
 ## Using the crate
 

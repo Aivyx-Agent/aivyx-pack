@@ -6,9 +6,11 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+use aivyx_pack::hub::{HubCheckOptions, hub_check, sign_hub_index};
 use aivyx_pack::{
-    PackError, build_payload, describe, keygen_to_file, load_signing_key, read_any_manifest,
-    read_bundle, verify_bundle, write_bundle,
+    AIVYX_PUBLISHER_KEYS, PackError, build_payload, describe, encode_verifying_key,
+    keygen_to_file, load_signing_key, read_any_manifest, read_bundle, verify_bundle,
+    write_bundle,
 };
 
 const USAGE: &str = "usage:
@@ -16,7 +18,11 @@ const USAGE: &str = "usage:
   aivyx-pack build <staging-dir> --key <keyfile> --out <file>
   aivyx-pack build <staging-dir> --yubikey [--serial <serial>] --out <file>
   aivyx-pack yubikey-init [--serial <serial>] [--overwrite-existing-key]
-  aivyx-pack inspect <file> [--trust <base64-key>]... [--allow-untrusted]";
+  aivyx-pack inspect <file> [--trust <base64-key>]... [--allow-untrusted]
+  aivyx-pack hub-check <hub-public-dir> [--trust <base64-key>]... [--allow-placeholders]
+                       [--require-signature] [--site-dist <dir>]
+  aivyx-pack hub-sign <hub-public-dir> --key <keyfile>
+  aivyx-pack hub-sign <hub-public-dir> --yubikey [--serial <serial>]";
 
 const NO_YUBIKEY: &str =
     "this aivyx-pack was built without YubiKey support (cargo build --features yubikey)";
@@ -35,6 +41,14 @@ enum Command {
     Build { staging: String, signer: Signer, out: String },
     YubikeyInit { serial: Option<String>, overwrite_existing_key: bool },
     Inspect { file: String, trust: Vec<String>, allow_untrusted: bool },
+    HubCheck {
+        dir: String,
+        trust: Vec<String>,
+        allow_placeholders: bool,
+        require_signature: bool,
+        site_dist: Option<String>,
+    },
+    HubSign { dir: String, signer: Signer },
     Help,
 }
 
@@ -43,7 +57,9 @@ impl Command {
     fn needs_yubikey(&self) -> bool {
         matches!(
             self,
-            Command::YubikeyInit { .. } | Command::Build { signer: Signer::YubiKey { .. }, .. }
+            Command::YubikeyInit { .. }
+                | Command::Build { signer: Signer::YubiKey { .. }, .. }
+                | Command::HubSign { signer: Signer::YubiKey { .. }, .. }
         )
     }
 }
@@ -138,6 +154,66 @@ fn parse(args: &[String]) -> Result<Command, String> {
             }
             Ok(Command::Inspect { file: file.to_string(), trust, allow_untrusted })
         }
+        ["hub-check", dir, rest @ ..] => {
+            let dir = operand("hub dir", dir)?;
+            let (mut trust, mut allow_placeholders, mut require_signature) =
+                (Vec::new(), false, false);
+            let mut site_dist = None;
+            let mut it = rest.iter();
+            while let Some(flag) = it.next() {
+                match *flag {
+                    "--trust" => {
+                        let v = it.next().ok_or("--trust needs a key")?;
+                        trust.push(operand("the value of --trust:", v)?.to_string())
+                    }
+                    "--site-dist" => {
+                        let v = it.next().ok_or("--site-dist needs a directory")?;
+                        site_dist = Some(operand("the value of --site-dist:", v)?.to_string())
+                    }
+                    "--allow-placeholders" => allow_placeholders = true,
+                    "--require-signature" => require_signature = true,
+                    other => return Err(format!("unknown option {other}")),
+                }
+            }
+            Ok(Command::HubCheck {
+                dir: dir.to_string(),
+                trust,
+                allow_placeholders,
+                require_signature,
+                site_dist,
+            })
+        }
+        ["hub-sign", dir, rest @ ..] => {
+            let dir = operand("hub dir", dir)?;
+            let (mut key, mut yubikey, mut serial) = (None, false, None);
+            let mut it = rest.iter();
+            while let Some(flag) = it.next() {
+                if *flag == "--yubikey" {
+                    yubikey = true;
+                    continue;
+                }
+                if !matches!(*flag, "--key" | "--serial") {
+                    return Err(format!("unknown option {flag}"));
+                }
+                let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
+                let value = operand(&format!("the value of {flag}:"), value)?.to_string();
+                if *flag == "--key" {
+                    key = Some(value)
+                } else {
+                    serial = Some(value)
+                }
+            }
+            let signer = match (key, yubikey) {
+                (Some(_), true) => return Err("hub-sign takes --key or --yubikey, not both".into()),
+                (Some(_), false) if serial.is_some() => {
+                    return Err("--serial goes with --yubikey".into());
+                }
+                (Some(key), false) => Signer::KeyFile(key),
+                (None, true) => Signer::YubiKey { serial },
+                (None, false) => return Err("hub-sign needs --key <keyfile> or --yubikey".into()),
+            };
+            Ok(Command::HubSign { dir: dir.to_string(), signer })
+        }
         _ => Err("unknown command".into()),
     }
 }
@@ -196,6 +272,40 @@ fn run(cmd: Command) -> Result<(), String> {
             let manifest = read_any_manifest(&bundle.payload).map_err(err)?;
             print!("{}", describe::describe(&manifest));
         }
+        Command::HubCheck { dir, trust, allow_placeholders, require_signature, site_dist } => {
+            let opts = HubCheckOptions {
+                builtin_keys: AIVYX_PUBLISHER_KEYS,
+                trust: &trust,
+                allow_placeholders,
+                require_signature,
+                site_dist: site_dist.as_deref().map(Path::new),
+            };
+            let report = hub_check(Path::new(&dir), &opts);
+            // One line per finding on stdout, greppable by CI.
+            for w in &report.warnings {
+                println!("! warning: {w}");
+            }
+            for p in &report.problems {
+                println!("\u{2717} {p}");
+            }
+            if !report.ok() {
+                return Err(format!("hub check failed: {} problem(s)", report.problems.len()));
+            }
+            let signed = if report.index_signed { ", index signed" } else { "" };
+            println!("\u{2713} hub ok: {} packs{signed}", report.packs);
+        }
+        Command::HubSign { dir, signer } => match signer {
+            Signer::KeyFile(key) => {
+                let key = load_signing_key(Path::new(&key)).map_err(err)?;
+                sign_hub_index(Path::new(&dir), &key).map_err(err)?;
+                println!("signed {dir}/packs/index.json -> packs/index.json.sig");
+                println!("  key: {}", encode_verifying_key(&key.verifying_key()));
+            }
+            #[cfg(feature = "yubikey")]
+            Signer::YubiKey { serial } => yubikey::hub_sign(Path::new(&dir), serial.as_deref())?,
+            #[cfg(not(feature = "yubikey"))]
+            Signer::YubiKey { .. } => return Err(NO_YUBIKEY.into()),
+        },
     }
     Ok(())
 }
@@ -261,6 +371,22 @@ mod yubikey {
         println!("signed on YubiKey {}", signer.card_serial());
         println!("verifying key (users trust packs signed with it):");
         println!("  {}", encode_verifying_key(&key));
+        Ok(())
+    }
+
+    /// `hub-sign <dir> --yubikey [--serial S]`.
+    pub fn hub_sign(hub: &Path, serial: Option<&str>) -> Result<(), String> {
+        let pin = prompt_pin("YubiKey user PIN: ")?;
+        let signer = open_signer(pin, serial)?;
+        println!("touch the YubiKey to sign…");
+        let key = aivyx_pack::yubikey::sign_hub_index_on_card(
+            hub,
+            &signer.public_key(),
+            &mut |m| signer.sign(m),
+        )
+        .map_err(|e| e.to_string())?;
+        println!("signed {}/packs/index.json -> packs/index.json.sig", hub.display());
+        println!("  on YubiKey {}, key: {}", signer.card_serial(), encode_verifying_key(&key));
         Ok(())
     }
 

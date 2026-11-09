@@ -34,6 +34,7 @@ use thiserror::Error;
 mod config_pack;
 pub use config_pack::{CoderPart, CoderSettings, PackVerification, check_coder_settings, ConfigPackManifest, PaPart, Product};
 pub mod describe;
+pub mod hub;
 #[cfg(feature = "yubikey")]
 #[doc(hidden)]
 pub mod yubikey;
@@ -183,7 +184,7 @@ impl PackManifest {
 }
 
 /// `x.y.z` and nothing else — digits and two dots, no spaces or suffixes.
-fn is_plain_version(s: &str) -> bool {
+pub(crate) fn is_plain_version(s: &str) -> bool {
     s.bytes().all(|b| b.is_ascii_digit() || b == b'.') && semverish(s).is_some()
 }
 
@@ -459,7 +460,7 @@ pub fn write_bundle_with(
 /// The temp file [`write_bundle_with`] writes before renaming it over
 /// `out`: `.<name>.<pid>-<random hex>.tmp` in `out`'s own directory, so the
 /// rename never crosses a filesystem and concurrent builds never collide.
-fn bundle_temp_path(out: &Path) -> Result<PathBuf, PackError> {
+pub(crate) fn bundle_temp_path(out: &Path) -> Result<PathBuf, PackError> {
     let name = out.file_name().ok_or_else(|| {
         PackError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -619,13 +620,21 @@ pub fn verify_bundle(
     bundle: &ReadBundle,
     trusted_publishers: &[String],
 ) -> Result<VerifyingKey, PackError> {
+    let keys = trusted_publishers.iter().map(String::as_str);
+    verify_bundle_against(bundle, keys.chain(AIVYX_PUBLISHER_KEYS.iter().copied()))
+}
+
+/// [`verify_bundle`] against exactly `trusted` (base64 keys), with no
+/// compiled-in keys added: `hub-check` passes its own, injectable list.
+pub(crate) fn verify_bundle_against<'a>(
+    bundle: &ReadBundle,
+    trusted: impl IntoIterator<Item = &'a str>,
+) -> Result<VerifyingKey, PackError> {
     let hint = decode_verifying_key(&bundle.publisher_hint).ok_or_else(|| {
         PackError::BadEntry(PUBLISHER_NAME, "not a valid Ed25519 key".into())
     })?;
-    let trusted = trusted_publishers
-        .iter()
-        .map(String::as_str)
-        .chain(AIVYX_PUBLISHER_KEYS.iter().copied())
+    let trusted = trusted
+        .into_iter()
         .filter_map(decode_verifying_key)
         .any(|k| k == hint);
     if !trusted {
