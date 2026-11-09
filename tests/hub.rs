@@ -299,7 +299,13 @@ fn the_schema_is_strict() {
     hub.edit(|e| {
         e["min_version"] = serde_json::json!({ "pa": "1.0.0" });
     });
-    one_problem(&hub.check(), "min_version has no \"coder\"");
+    // (The bundle is still checked, and disagrees too.)
+    let r = hub.check();
+    assert!(
+        r.problems[0].contains("min_version has no \"coder\""),
+        "{:#?}",
+        r.problems
+    );
     std::fs::write(
         hub.dir.join("packs/index.json"),
         r#"{"schema_version": 1, "packs": []}"#,
@@ -313,16 +319,45 @@ fn the_schema_is_strict() {
 fn placeholders_fail_unless_allowed() {
     let hub = Hub::new("placeholder");
     hub.edit(|e| e["sha256"] = "PLACEHOLDER_NOT_YET_SIGNED".into());
-    // One line for the placeholder; the entry's other checks are skipped,
-    // and its file still counts as listed.
+    // Reported once; the bundle still counts as listed.
     one_problem(&hub.check(), "packs[0].sha256 is a placeholder");
     let r = hub.check_with(|o| o.allow_placeholders = true);
     assert!(r.ok(), "{:#?}", r.problems);
-    assert_eq!(r.warnings.len(), 1);
-    assert!(r.warnings[0].contains("placeholder"));
-    // Case-insensitive, anywhere.
-    hub.edit(|e| e["description"] = "coming soon (placeholder)".into());
-    one_problem(&hub.check(), "packs[0].description is a placeholder");
+    assert_eq!(r.warnings.len(), 1, "{:#?}", r.warnings);
+    assert!(r.warnings[0].contains("packs[0].sha256 is a placeholder"));
+}
+
+#[test]
+fn a_placeholder_suppresses_only_its_own_field() {
+    // A placeholder description doesn't excuse a wrong sha256.
+    let hub = Hub::new("placeholder-narrow");
+    hub.edit(|e| {
+        e["description"] = "PLACEHOLDER_COPY".into();
+        e["sha256"] = "0".repeat(64).into();
+    });
+    let r = hub.check_with(|o| o.allow_placeholders = true);
+    assert_eq!(r.warnings.len(), 1, "{:#?}", r.warnings);
+    one_problem(&r, "sha256 is ");
+    // Other field checks still run too.
+    hub.edit(|e| {
+        e["description"] = "PLACEHOLDER_COPY".into();
+        e["min_version"]["pa"] = "1.0".into();
+    });
+    let r = hub.check_with(|o| o.allow_placeholders = true);
+    assert!(
+        r.problems
+            .iter()
+            .any(|p| p.contains("min_version.pa \"1.0\" must be x.y.z")),
+        "{:#?}",
+        r.problems
+    );
+}
+
+#[test]
+fn the_word_placeholder_in_prose_is_not_a_placeholder() {
+    let hub = Hub::new("placeholder-prose");
+    hub.edit(|e| e["description"] = "Replaces the placeholder pack.".into());
+    assert!(hub.check().ok());
 }
 
 #[test]
@@ -546,6 +581,7 @@ fn the_commands_end_to_end() {
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains(&hub.pubkey));
 
+    std::fs::write(hub.dir.join("index.html"), "<!doctype html><p>Hub</p>").unwrap();
     let out = bin()
         .args([
             "hub-check",
@@ -649,4 +685,66 @@ fn a_format_1_pack_lists_one_bundle_per_target() {
     kitchen["file"] = file.into();
     write(&kitchen);
     one_problem(&hub.check(), "a format 1 pack lists targets, not file");
+}
+
+#[test]
+fn an_empty_site_dist_fails() {
+    let hub = Hub::new("emptysite");
+    let dist = hub.dir.join("packs");
+    one_problem(
+        &hub.check_with(|o| o.site_dist = Some(&dist)),
+        "no .html, .htm, .xhtml or .svg files found",
+    );
+}
+
+#[test]
+fn site_dist_scans_htm_xhtml_and_svg() {
+    let hub = Hub::new("sitetypes");
+    let dist = hub.dir.parent().unwrap().join("dist");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(dist.join("a.HTM"), "<p onclick=\"x()\">").unwrap();
+    std::fs::write(dist.join("b.xhtml"), "<a href=\"javascript:x()\">").unwrap();
+    std::fs::write(dist.join("c.svg"), "<svg><script>x()</script></svg>").unwrap();
+    std::fs::write(dist.join("d.svg"), "<svg><script href=\"/x.js\"/></svg>").unwrap();
+    let r = hub.check_with(|o| o.site_dist = Some(&dist));
+    assert_eq!(r.problems.len(), 3, "{:#?}", r.problems);
+    assert!(r.problems[0].starts_with("site: a.HTM:1: inline event handler onclick="));
+    assert!(r.problems[1].starts_with("site: b.xhtml:1: href is a javascript: URL"));
+    assert!(r.problems[2].starts_with("site: c.svg:1: inline <script>"));
+}
+
+#[test]
+fn stray_bundles_any_case_and_subfolders_fail() {
+    let hub = Hub::new("strays");
+    let packs = hub.dir.join("packs");
+    std::fs::copy(packs.join(FILE), packs.join("old-0.0.1.AIVYXPACK")).unwrap();
+    std::fs::create_dir_all(packs.join("old")).unwrap();
+    std::fs::copy(packs.join(FILE), packs.join("old").join(FILE)).unwrap();
+    let r = hub.check();
+    assert_eq!(r.problems.len(), 2, "{:#?}", r.problems);
+    assert!(r.problems[0].contains("packs/old-0.0.1.AIVYXPACK: not listed"));
+    assert!(r.problems[1].contains("packs/old/: subfolders are not allowed"));
+}
+
+#[test]
+fn a_duplicate_key_in_the_index_fails() {
+    // A second "sha256" a lenient reader would take instead of the first.
+    let hub = Hub::new("dupkey");
+    let text =
+        serde_json::to_string(&serde_json::json!({ "schema_version": 2, "packs": [hub.entry()] }))
+            .unwrap()
+            .replacen(
+                "\"sha256\":",
+                &format!("\"sha256\":\"{}\",\"sha256\":", "0".repeat(64)),
+                1,
+            );
+    std::fs::write(hub.dir.join("packs/index.json"), text).unwrap();
+    let r = hub.check();
+    assert!(
+        r.problems
+            .iter()
+            .any(|p| p.contains("duplicate field `sha256`")),
+        "{:#?}",
+        r.problems
+    );
 }

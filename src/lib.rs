@@ -542,8 +542,17 @@ pub struct ReadBundle {
 /// Read the outer tar. Unknown entries are refused (the format is
 /// exactly three entries; anything extra is suspicious).
 pub fn read_bundle(path: &Path) -> Result<ReadBundle, PackError> {
-    let file = std::fs::File::open(path)?;
-    let mut archive = tar::Archive::new(file);
+    read_bundle_from(std::fs::File::open(path)?)
+}
+
+/// [`read_bundle`] from bytes already in memory (`hub-check` hashes, sizes
+/// and parses one buffer, so all three see the same bytes).
+pub fn read_bundle_bytes(bytes: &[u8]) -> Result<ReadBundle, PackError> {
+    read_bundle_from(bytes)
+}
+
+fn read_bundle_from(reader: impl Read) -> Result<ReadBundle, PackError> {
+    let mut archive = tar::Archive::new(reader);
     let mut payload = None;
     let mut signature = None;
     let mut publisher = None;

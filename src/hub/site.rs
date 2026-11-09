@@ -1,10 +1,11 @@
-//! `hub-check --site-dist`: scan a built site's HTML for what the Hub's
+//! `hub-check --site-dist`: scan a built site's pages for what the Hub's
 //! Content-Security-Policy (`script-src 'self'; style-src 'self'`) would
 //! break, and for links into private repositories.
 //!
 //! A small hand-written scanner: it reads tags and their attributes, skips
-//! comments, and treats `<script>`/`<style>` bodies as raw text. It is a
-//! lint for a site we build ourselves, not a general HTML parser.
+//! comments, and treats `<script>`/`<style>` bodies as raw text. Attribute
+//! values and text are entity-decoded before the private-link match. It is
+//! a lint for a site we build ourselves, not a general HTML parser.
 
 use std::path::{Path, PathBuf};
 
@@ -22,12 +23,40 @@ pub const PRIVATE_REPOS: &[&str] = &[
     "aivyx-deploy",
 ];
 
-/// Scan every `.html` file under `dist`. Returns one line per problem:
-/// `site: <file>:<line>: <what>: <excerpt>`.
+/// Hosts (lowercase, with the org) whose next path segment is a repo name.
+/// `githubusercontent.com` covers `raw.githubusercontent.com`.
+const REPO_HOSTS: &[&str] = &[
+    "github.com/aivyx-agent/",
+    "githubusercontent.com/aivyx-agent/",
+];
+
+/// The page types scanned.
+const PAGE_EXTENSIONS: &[&str] = &["html", "htm", "xhtml", "svg"];
+
+/// `<script type>` values that mean JavaScript (an absent type does too).
+const JS_TYPES: &[&str] = &[
+    "",
+    "module",
+    "text/javascript",
+    "application/javascript",
+    "text/ecmascript",
+    "application/ecmascript",
+    "application/x-javascript",
+];
+
+/// Scan every page (`.html`, `.htm`, `.xhtml`, `.svg`) under `dist`.
+/// Returns one line per problem: `site: <file>:<line>: <what>: <excerpt>`.
+/// A folder with no pages is itself a problem (a wrong path must not pass).
 pub fn check_site(dist: &Path) -> Vec<String> {
     let mut files = Vec::new();
-    if let Err(e) = collect_html(dist, &mut files) {
+    if let Err(e) = collect_pages(dist, &mut files) {
         return vec![format!("site: {}: {e}", dist.display())];
+    }
+    if files.is_empty() {
+        return vec![format!(
+            "site: {}: no .html, .htm, .xhtml or .svg files found (is this the built site?)",
+            dist.display()
+        )];
     }
     files.sort();
     let mut out = Vec::new();
@@ -49,17 +78,17 @@ pub fn check_site(dist: &Path) -> Vec<String> {
     out
 }
 
-fn collect_html(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn collect_pages(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let ft = entry.file_type()?;
         let path = entry.path();
         if ft.is_dir() {
-            collect_html(&path, out)?;
+            collect_pages(&path, out)?;
         } else if ft.is_file()
             && path
                 .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("html"))
+                .is_some_and(|e| PAGE_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
         {
             out.push(path);
         }
@@ -77,25 +106,56 @@ struct Tag {
     end: usize,
 }
 
-/// `(line, problem)` for one HTML document.
+impl Tag {
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+fn excerpt(s: &str) -> String {
+    let s: String = s
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    let s = s.trim();
+    let mut e: String = s.chars().take(80).collect();
+    if s.chars().count() > 80 {
+        e.push('…');
+    }
+    e
+}
+
+/// `(line, problem)` for one page.
 pub fn scan_html(html: &str) -> Vec<(usize, String)> {
     let bytes = html.as_bytes();
     let line_of = |at: usize| html[..at].bytes().filter(|&b| b == b'\n').count() + 1;
-    let snippet = |start: usize, end: usize| {
-        let s: String = html[start..end]
-            .chars()
-            .map(|c| if c.is_whitespace() { ' ' } else { c })
-            .collect();
-        let mut e: String = s.chars().take(80).collect();
-        if s.chars().count() > 80 {
-            e.push('…');
-        }
-        e
-    };
     let mut out = Vec::new();
+    // Private links in a run of text (decoded or raw), reported at `at`.
+    // (Lines: the run's start line plus the newlines before the match, so
+    // a decoded run stays close enough to the source.)
+    let text_links = |out: &mut Vec<(usize, String)>, text: &str, at: usize, what: &str| {
+        for (repo, pos) in private_repo_links(text) {
+            let line = line_of(at) + text[..pos].matches('\n').count();
+            out.push((
+                line,
+                format!(
+                    "{what} links the private repo {repo}: {}",
+                    excerpt(&text[pos..])
+                ),
+            ));
+        }
+    };
     let mut i = 0;
-    while let Some(off) = html[i..].find('<') {
-        let at = i + off;
+    loop {
+        let next = html[i..].find('<').map(|o| i + o);
+        let text_end = next.unwrap_or(html.len());
+        if text_end > i {
+            text_links(&mut out, &decode_entities(&html[i..text_end]), i, "text");
+        }
+        let Some(at) = next else { break };
         let rest = &html[at..];
         if let Some(comment) = rest.strip_prefix("<!--") {
             i = comment.find("-->").map_or(html.len(), |e| at + 4 + e + 3);
@@ -111,41 +171,80 @@ pub fn scan_html(html: &str) -> Vec<(usize, String)> {
         }
         let tag = parse_tag(html, at);
         i = tag.end;
-        let excerpt = snippet(tag.start, tag.end);
+        let ex = excerpt(&html[tag.start..tag.end]);
         let line = line_of(tag.start);
-        let has = |name: &str| tag.attrs.iter().any(|(n, _)| n == name);
         match tag.name.as_str() {
-            "script" if !has("src") => out.push((
-                line,
-                format!("inline <script> (no src; CSP script-src 'self' blocks it): {excerpt}"),
-            )),
+            // SVG scripts name their file with `href` / `xlink:href`.
+            "script"
+                if ["src", "href", "xlink:href"]
+                    .iter()
+                    .all(|a| tag.attr(a).is_none_or(|s| s.trim().is_empty())) =>
+            {
+                let ty = tag.attr("type").unwrap_or("").trim().to_ascii_lowercase();
+                out.push((
+                    line,
+                    if JS_TYPES.contains(&ty.as_str()) {
+                        format!("inline <script> (no src; CSP script-src 'self' blocks it): {ex}")
+                    } else {
+                        format!("inline data script (type={ty}); serve it as a file: {ex}")
+                    },
+                ));
+            }
             "style" => out.push((
                 line,
-                format!("inline <style> element (CSP style-src 'self' blocks it): {excerpt}"),
+                format!("inline <style> element (CSP style-src 'self' blocks it): {ex}"),
             )),
             _ => {}
         }
-        if has("style") {
-            out.push((
-                line,
-                format!("inline style=\"…\" attribute (CSP style-src 'self' blocks it): {excerpt}"),
-            ));
-        }
         for (name, value) in &tag.attrs {
-            if let Some(repo) = private_repo_link(value) {
+            let value = decode_entities(value);
+            if name == "style" {
                 out.push((
                     line,
-                    format!("{name} links the private repo {repo}: {excerpt}"),
+                    format!("inline style=\"…\" attribute (CSP style-src 'self' blocks it): {ex}"),
                 ));
             }
+            if name.len() > 2 && name.starts_with("on") {
+                out.push((
+                    line,
+                    format!("inline event handler {name}= (CSP script-src 'self' blocks it): {ex}"),
+                ));
+            }
+            if is_javascript_url(&value) {
+                out.push((line, format!("{name} is a javascript: URL: {ex}")));
+            }
+            for (repo, _) in private_repo_links(&value) {
+                out.push((line, format!("{name} links the private repo {repo}: {ex}")));
+            }
         }
-        // Script and style bodies are raw text, not markup.
+        // Script and style bodies are raw text, not markup: scan them for
+        // private links as written and as decoded.
         if matches!(tag.name.as_str(), "script" | "style") {
             let close = format!("</{}", tag.name);
-            i = find_ci(html, i, &close).unwrap_or(html.len());
+            let end = find_ci(html, i, &close).unwrap_or(html.len());
+            let body = &html[i..end];
+            let what = format!("<{}> body", tag.name);
+            let raw = private_repo_links(body);
+            if raw.is_empty() {
+                text_links(&mut out, &decode_entities(body), i, &what);
+            } else {
+                text_links(&mut out, body, i, &what);
+            }
+            i = end;
         }
     }
     out
+}
+
+/// A `javascript:` URL, as a browser reads it: ASCII whitespace and control
+/// characters inside the scheme are ignored, any case.
+fn is_javascript_url(value: &str) -> bool {
+    let squeezed: String = value
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && !c.is_ascii_control())
+        .take(11)
+        .collect();
+    squeezed.eq_ignore_ascii_case("javascript:")
 }
 
 /// Parse the start tag at `at` (`html[at] == '<'`).
@@ -220,31 +319,100 @@ fn find_ci(html: &str, from: usize, needle: &str) -> Option<usize> {
         .find(|&i| hay[i..i + n.len()].eq_ignore_ascii_case(n))
 }
 
-/// The private repo `value` links under `github.com/Aivyx-Agent/`, if any
-/// (any case, with or without `www.`, with any trailing path or anchor).
-pub fn private_repo_link(value: &str) -> Option<&'static str> {
-    let lower = value.to_ascii_lowercase();
-    const HOST: &str = "github.com/aivyx-agent/";
-    let mut from = 0;
-    while let Some(off) = lower[from..].find(HOST) {
-        let at = from + off;
-        from = at + HOST.len();
-        // `github.com` must be the host itself or a subdomain's tail
-        // (`www.github.com`), not part of a longer name (`notgithub.com`).
-        let before = lower[..at].bytes().next_back();
-        if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'-') {
+/// Decode the character references a link could hide behind: numeric
+/// (`&#47;`, `&#x2F;`, with or without the `;`) and the named `&sol;`,
+/// `&period;`, `&colon;`, `&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`. One
+/// pass, as a browser does (`&amp;#47;` is the text `&#47;`).
+pub fn decode_entities(s: &str) -> String {
+    const NAMED: &[(&str, char)] = &[
+        ("sol;", '/'),
+        ("period;", '.'),
+        ("colon;", ':'),
+        ("amp;", '&'),
+        ("lt;", '<'),
+        ("gt;", '>'),
+        ("quot;", '"'),
+        ("apos;", '\''),
+    ];
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        if let Some(num) = after.strip_prefix('#') {
+            let (hex, digits) = match num.strip_prefix(['x', 'X']) {
+                Some(h) => (true, h),
+                None => (false, num),
+            };
+            let len = digits
+                .bytes()
+                .take_while(|b| {
+                    if hex {
+                        b.is_ascii_hexdigit()
+                    } else {
+                        b.is_ascii_digit()
+                    }
+                })
+                .count();
+            let code = u32::from_str_radix(&digits[..len], if hex { 16 } else { 10 }).ok();
+            if let Some(c) = code.filter(|_| len > 0).and_then(char::from_u32) {
+                out.push(c);
+                let consumed = 1 + usize::from(hex) + len;
+                let semi = usize::from(after[consumed..].starts_with(';'));
+                rest = &after[consumed + semi..];
+                continue;
+            }
+        } else if let Some((name, c)) = NAMED
+            .iter()
+            .find(|(n, _)| after.len() >= n.len() && after[..n.len()].eq_ignore_ascii_case(n))
+        {
+            out.push(*c);
+            rest = &after[name.len()..];
             continue;
         }
-        let name: String = lower[from..]
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-            .collect();
-        let name = name.strip_suffix(".git").unwrap_or(&name);
-        if let Some(repo) = PRIVATE_REPOS.iter().find(|r| **r == name) {
-            return Some(repo);
+        out.push('&');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Every private repo `text` links under `github.com/Aivyx-Agent/` or
+/// `raw.githubusercontent.com/Aivyx-Agent/` (any case, with or without
+/// `www.`, with any trailing path or anchor), with the byte offset where
+/// the host starts.
+pub fn private_repo_links(text: &str) -> Vec<(&'static str, usize)> {
+    let lower = text.to_ascii_lowercase();
+    let mut found = Vec::new();
+    for host in REPO_HOSTS {
+        let mut from = 0;
+        while let Some(off) = lower[from..].find(host) {
+            let at = from + off;
+            from = at + host.len();
+            // The host itself or a subdomain's tail (`www.github.com`,
+            // `raw.githubusercontent.com`), not part of a longer name
+            // (`notgithub.com`).
+            let before = lower[..at].bytes().next_back();
+            if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'-') {
+                continue;
+            }
+            let name: String = lower[from..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                .collect();
+            let name = name.strip_suffix(".git").unwrap_or(&name);
+            if let Some(repo) = PRIVATE_REPOS.iter().find(|r| **r == name) {
+                found.push((*repo, at));
+            }
         }
     }
-    None
+    found.sort_by_key(|(_, at)| *at);
+    found
+}
+
+/// The first private repo `value` links, if any.
+pub fn private_repo_link(value: &str) -> Option<&'static str> {
+    private_repo_links(value).first().map(|(r, _)| *r)
 }
 
 #[cfg(test)]
@@ -259,6 +427,7 @@ mod tests {
             "github.com/Aivyx-Agent/aivyx-verticals/blob/main/x.md",
             "https://github.com/Aivyx-Agent/aivyx-deploy.git",
             "https://github.com/Aivyx-Agent/aivyx-coder-bench?tab=readme",
+            "https://raw.githubusercontent.com/Aivyx-Agent/aivyx-brand/main/logo.svg",
         ] {
             assert!(private_repo_link(hit).is_some(), "{hit}");
         }
@@ -274,31 +443,75 @@ mod tests {
     }
 
     #[test]
-    fn scanner_rules() {
-        let lines = |html: &str| {
-            scan_html(html)
-                .into_iter()
-                .map(|(_, m)| m)
-                .collect::<Vec<_>>()
-        };
-        assert!(
-            lines(
-                r#"<!doctype html><html><head><script type="module" src="/theme.js"></script>
+    fn entities_are_decoded() {
+        assert_eq!(
+            decode_entities("https&colon;&sol;&sol;github&period;com&#47;x&#x2F;y&#47z&amp;w"),
+            "https://github.com/x/y/z&w"
+        );
+        assert_eq!(
+            decode_entities("&amp;#47; &bogus; &#; & &#x;"),
+            "&#47; &bogus; &#; & &#x;"
+        );
+        assert_eq!(decode_entities("caf\u{e9} &#233;"), "caf\u{e9} \u{e9}");
+    }
+
+    #[test]
+    fn javascript_urls() {
+        for js in ["javascript:alert(1)", " JaVa\tScRiPt:x", "java\nscript:"] {
+            assert!(is_javascript_url(js), "{js:?}");
+        }
+        assert!(!is_javascript_url("https://x/javascript:"));
+    }
+
+    fn lines(html: &str) -> Vec<String> {
+        scan_html(html).into_iter().map(|(_, m)| m).collect()
+    }
+
+    #[test]
+    fn a_clean_page_passes() {
+        let page = r#"<!doctype html><html><head><script type="module" src="/theme.js"></script>
             <link rel="stylesheet" href="/site.css"></head>
             <body class=x><a href="https://github.com/Aivyx-Agent/aivyx-pack">ok</a>
             <!-- <script>alert(1)</script> style="x" github.com/Aivyx-Agent/aivyx-hub -->
-            </body></html>"#
-            )
-            .is_empty()
-        );
+            <p>a &lt; b, and the online shop</p>
+            </body></html>"#;
+        assert!(lines(page).is_empty(), "{:?}", lines(page));
+    }
+
+    #[test]
+    fn inline_scripts_and_styles() {
         let found = lines("<p>\n<SCRIPT type=module>let s = '<style>';</script>");
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("inline <script>"));
         assert_eq!(scan_html("<p>\n\n<script>x</script>")[0].0, 3);
+        let found = lines("<script src=\"\">x</script>");
+        assert!(found[0].contains("inline <script>"), "{found:?}");
+        let found = lines("<script type=\"application/ld+json\">{}</script>");
+        assert!(
+            found[0].contains("inline data script (type=application/ld+json); serve it as a file"),
+            "{found:?}"
+        );
         let found = lines("<style>p{}</style>");
         assert!(found[0].contains("<style> element"), "{found:?}");
         let found = lines("<div STYLE='color:red'>");
         assert!(found[0].contains("style=\""), "{found:?}");
+    }
+
+    #[test]
+    fn event_handlers_and_javascript_urls() {
+        let found = lines("<button onClick=\"go()\">");
+        assert!(
+            found[0].contains("inline event handler onclick="),
+            "{found:?}"
+        );
+        let found = lines("<a href=\"java&#115;cript:go()\">");
+        assert!(found[0].contains("href is a javascript: URL"), "{found:?}");
+        // `on` alone and names merely containing it are fine.
+        assert!(lines("<x on=\"1\" data-on=\"2\">").is_empty());
+    }
+
+    #[test]
+    fn private_links_anywhere() {
         let found = lines("<img src=https://github.com/aivyx-agent/aivyx-brand/raw/x.png>");
         assert!(
             found[0].contains("src links the private repo aivyx-brand"),
@@ -306,5 +519,35 @@ mod tests {
         );
         let found = lines("<a title='a > b' href=\"https://github.com/Aivyx-Agent/aivyx-hub#x\">");
         assert!(found[0].contains("aivyx-hub"), "{found:?}");
+        let found = lines(
+            "<a href=\"https&colon;&sol;&sol;github&period;com&#47;Aivyx-Agent&#x2F;aivyx-hub\">",
+        );
+        assert!(
+            found[0].contains("href links the private repo aivyx-hub"),
+            "{found:?}"
+        );
+        let found = lines("<p>\nsee github.com/Aivyx-Agent/aivyx-ecosystem for more</p>");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("text links the private repo aivyx-ecosystem"));
+        assert_eq!(
+            scan_html("<p>\nsee github.com/Aivyx-Agent/aivyx-ecosystem")[0].0,
+            2
+        );
+        let found = lines(
+            "<script src=/a.js>fetch('https://raw.githubusercontent.com/Aivyx-Agent/aivyx-deploy/x')</script>",
+        );
+        assert!(
+            found[0].contains("<script> body links the private repo aivyx-deploy"),
+            "{found:?}"
+        );
+        let found = lines(
+            "<link rel=x href=/a.css><style src=x>a{background:url(//github.com/Aivyx-Agent/aivyx-website/x.png)}</style>",
+        );
+        assert!(
+            found
+                .iter()
+                .any(|l| l.contains("<style> body links the private repo aivyx-website")),
+            "{found:?}"
+        );
     }
 }

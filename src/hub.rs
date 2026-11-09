@@ -17,20 +17,20 @@
 //! the prefixed index, so neither can be passed off as the other.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::path::Path;
 
 use base64::Engine;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
     Manifest, PackError, Product, SignFn, bundle_temp_path, check_name, decode_verifying_key,
-    is_plain_version, read_any_manifest, read_bundle, verify_bundle_against,
+    is_plain_version, read_any_manifest, read_bundle_bytes, verify_bundle_against,
 };
 
-mod site;
+pub mod site;
 pub use site::check_site;
 
 /// The only `schema_version` this crate reads.
@@ -138,13 +138,20 @@ impl HubIndex {
     /// Parse `index.json`: `schema_version` must be 2 and the shape exact
     /// (unknown fields are refused). Field values are checked by
     /// [`HubIndex::problems`].
+    ///
+    /// The structs are deserialized from the bytes themselves, never from
+    /// an intermediate `serde_json::Value` (which keeps the last of two
+    /// equal keys): every object in a valid index is a derived struct with
+    /// `deny_unknown_fields`, and serde's derive refuses a duplicate field,
+    /// so a key given twice anywhere is an error, and what is checked is
+    /// what any other strict reader would see.
     pub fn parse(bytes: &[u8]) -> Result<Self, PackError> {
-        let value: serde_json::Value = serde_json::from_slice(bytes)
-            .map_err(|e| PackError::BadManifest(format!("not JSON: {e}")))?;
-        Self::from_value(value).map_err(PackError::BadManifest)
+        Self::parse_str(bytes).map_err(PackError::BadManifest)
     }
 
-    fn from_value(value: serde_json::Value) -> Result<Self, String> {
+    fn parse_str(bytes: &[u8]) -> Result<Self, String> {
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|e| format!("not JSON: {e}"))?;
         match value.get("schema_version") {
             Some(v) if v.as_u64() == Some(HUB_SCHEMA_VERSION.into()) => {}
             Some(v) => {
@@ -152,7 +159,7 @@ impl HubIndex {
             }
             None => return Err("no schema_version".into()),
         }
-        serde_json::from_value(value).map_err(|e| format!("not a schema 2 Hub manifest: {e}"))
+        serde_json::from_slice(bytes).map_err(|e| format!("not a schema 2 Hub manifest: {e}"))
     }
 
     /// Every field-level problem, one line each (placeholders are not
@@ -216,18 +223,42 @@ impl HubEntry {
         format!("{INDEX_PATH}: packs[{i}] ({:?})", self.name)
     }
 
-    /// Field-level problems with this entry, one line each.
+    /// The file name an entry's bundle must have: `<name>-<version>.aivyxpack`,
+    /// or `<name>-<version>-<target>.aivyxpack` for a format 1 target.
+    pub fn expected_file(&self, target: Option<&str>) -> String {
+        match target {
+            None => format!("{}-{}.aivyxpack", self.name, self.version),
+            Some(t) => format!("{}-{}-{t}.aivyxpack", self.name, self.version),
+        }
+    }
+
+    /// The bundles this entry really lists: `file` is not a placeholder,
+    /// is a plain name, and is the expected one. Nothing else is ever
+    /// opened, and anything else in `packs/` is a stray.
+    pub fn listed_files(&self) -> Vec<HubFile<'_>> {
+        self.files()
+            .into_iter()
+            .filter(|f| !is_placeholder(f.file))
+            .filter(|f| (self.format == 2) == f.target.is_none())
+            .filter(|f| file_problem(f.file, &self.expected_file(f.target)).is_none())
+            .collect()
+    }
+
+    /// Field-level problems with this entry, one line each. A field whose
+    /// own value is a placeholder (starts with `PLACEHOLDER`) is not
+    /// checked here: the placeholder check reports it.
     pub fn problems(&self, i: usize) -> Vec<String> {
         let at = self.label(i);
         let mut out = Vec::new();
         let mut bad = |msg: String| out.push(format!("{at}: {msg}"));
-        if check_name(&self.name).is_err() {
+        let real = |s: &str| !is_placeholder(s);
+        if real(&self.name) && check_name(&self.name).is_err() {
             bad(format!(
                 "name {:?} must be alphanumeric/dash/underscore",
                 self.name
             ));
         }
-        if !is_plain_version(&self.version) {
+        if real(&self.version) && !is_plain_version(&self.version) {
             bad(format!("version {:?} must be x.y.z", self.version));
         }
         for (field, value) in [
@@ -261,7 +292,7 @@ impl HubEntry {
                     "min_version has {:?}, which products doesn't list",
                     product.as_str()
                 )),
-                (true, Some(v)) if !is_plain_version(v) => bad(format!(
+                (true, Some(v)) if real(v) && !is_plain_version(v) => bad(format!(
                     "min_version.{} {v:?} must be x.y.z",
                     product.as_str()
                 )),
@@ -281,13 +312,16 @@ impl HubEntry {
                 if !self.targets.is_empty() {
                     bad("a format 2 pack has no targets".into());
                 }
-                if let Some(file) = &self.file {
-                    let want = format!("{}-{}.aivyxpack", self.name, self.version);
-                    if let Some(msg) = file_problem(file, &want) {
+                if let Some(file) = self.file.as_deref().filter(|f| real(f)) {
+                    if let Some(msg) = file_problem(file, &self.expected_file(None)) {
                         bad(msg);
                     }
                 }
-                if let Some(sha) = self.sha256.as_ref().filter(|s| !is_sha256_hex(s)) {
+                let sha = self
+                    .sha256
+                    .as_deref()
+                    .filter(|s| real(s) && !is_sha256_hex(s));
+                if let Some(sha) = sha {
                     bad(format!("sha256 {sha:?} must be 64 lowercase hex digits"));
                 }
             }
@@ -300,6 +334,9 @@ impl HubEntry {
                 }
                 let mut seen = BTreeSet::new();
                 for t in &self.targets {
+                    if !real(&t.target) {
+                        continue;
+                    }
                     if !is_target(&t.target) {
                         bad(format!("target {:?} is not a target triple", t.target));
                         continue;
@@ -307,11 +344,13 @@ impl HubEntry {
                     if !seen.insert(t.target.as_str()) {
                         bad(format!("target {:?} is listed twice", t.target));
                     }
-                    let want = format!("{}-{}-{}.aivyxpack", self.name, self.version, t.target);
-                    if let Some(msg) = file_problem(&t.file, &want) {
-                        bad(msg);
+                    if real(&t.file) {
+                        let want = self.expected_file(Some(&t.target));
+                        if let Some(msg) = file_problem(&t.file, &want) {
+                            bad(msg);
+                        }
                     }
-                    if !is_sha256_hex(&t.sha256) {
+                    if real(&t.sha256) && !is_sha256_hex(&t.sha256) {
                         bad(format!(
                             "target {:?}: sha256 {:?} must be 64 lowercase hex digits",
                             t.target, t.sha256
@@ -356,12 +395,18 @@ fn is_target(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-fn is_placeholder(s: &str) -> bool {
-    s.to_ascii_lowercase().contains("placeholder")
+/// The marker a not-yet-real value starts with.
+pub const PLACEHOLDER: &str = "PLACEHOLDER";
+
+/// A placeholder value: it starts with the exact marker `PLACEHOLDER`
+/// (`PLACEHOLDER_NOT_YET_SIGNED`). Prose that merely mentions the word is
+/// not one.
+pub fn is_placeholder(s: &str) -> bool {
+    s.trim_start().starts_with(PLACEHOLDER)
 }
 
-/// `(json path, value)` for every key or string anywhere in `value` that
-/// contains `PLACEHOLDER` (any case).
+/// `(json path, value)` for every string value anywhere in `value` that is
+/// a placeholder.
 fn placeholders(value: &serde_json::Value, path: String, out: &mut Vec<(String, String)>) {
     match value {
         serde_json::Value::String(s) if is_placeholder(s) => out.push((path, s.clone())),
@@ -377,9 +422,6 @@ fn placeholders(value: &serde_json::Value, path: String, out: &mut Vec<(String, 
                 } else {
                     format!("{path}.{k}")
                 };
-                if is_placeholder(k) {
-                    out.push((child.clone(), k.clone()));
-                }
                 placeholders(v, child, out);
             }
         }
@@ -416,7 +458,7 @@ pub fn verify_hub_index(
     let sig = Signature::from_bytes(&arr);
     let message = hub_index_message(index);
     keys.iter()
-        .find(|k| k.verify(&message, &sig).is_ok())
+        .find(|k| k.verify_strict(&message, &sig).is_ok())
         .copied()
         .ok_or(PackError::BadSignature)
 }
@@ -436,7 +478,7 @@ pub fn sign_hub_index_with(
     let message = hub_index_message(&index);
     let signature = Signature::from_bytes(&sign(&message)?);
     public_key
-        .verify(&message, &signature)
+        .verify_strict(&message, &signature)
         .map_err(|_| PackError::BadSignature)?;
     let text = format!(
         "{}\n",
@@ -500,23 +542,25 @@ pub struct PublisherKeyFile {
     pub keys: Vec<VerifyingKey>,
     /// One line per malformed key line.
     pub problems: Vec<String>,
-    /// True when any line (comments included) contains `PLACEHOLDER`.
+    /// True when a non-comment line is a placeholder (starts with
+    /// `PLACEHOLDER`). Comments never set it.
     pub placeholder: bool,
 }
 
 /// Parse `publisher-key.txt`: blank lines and `#` comment lines are
-/// skipped; every other line is one base64 Ed25519 verifying key. A
-/// non-comment line containing `PLACEHOLDER` is not a key and not a
-/// problem here: it sets `placeholder`.
+/// skipped (whatever they say); every other line is one base64 Ed25519
+/// verifying key. A non-comment line that is a placeholder (starts with
+/// `PLACEHOLDER`) is not a key and not a problem here: it sets
+/// `placeholder`.
 pub fn parse_publisher_keys(text: &str) -> PublisherKeyFile {
     let mut out = PublisherKeyFile::default();
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
-        if is_placeholder(line) {
-            out.placeholder = true;
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if line.is_empty() || line.starts_with('#') {
+        if is_placeholder(line) {
+            out.placeholder = true;
             continue;
         }
         match decode_verifying_key(line) {
@@ -683,9 +727,8 @@ fn check_index(
     };
     let mut found = Vec::new();
     placeholders(&value, String::new(), &mut found);
-    // Entries (by index) holding a placeholder: their field and bundle
-    // checks are skipped, since the placeholder line already says why.
-    let mut placeholder_entries = BTreeSet::new();
+    // A placeholder only stands in for its own field: every other check,
+    // and the bundle checks whenever file and sha256 are real, still run.
     for (path, v) in &found {
         let line = format!("{INDEX_PATH}: {path} is a placeholder ({:?})", excerpt(v));
         if opts.allow_placeholders {
@@ -693,15 +736,8 @@ fn check_index(
         } else {
             r.problems.push(line);
         }
-        if let Some(i) = path
-            .strip_prefix("packs[")
-            .and_then(|rest| rest.split(']').next())
-            .and_then(|n| n.parse::<usize>().ok())
-        {
-            placeholder_entries.insert(i);
-        }
     }
-    let index = match HubIndex::from_value(value) {
+    let index = match HubIndex::parse_str(bytes) {
         Ok(i) => i,
         Err(e) => {
             r.problems.push(format!("{INDEX_PATH}: {e}"));
@@ -711,29 +747,23 @@ fn check_index(
     r.packs = index.packs.len();
     r.problems.extend(index.duplicates());
     let mut listed = BTreeSet::new();
-    for entry in &index.packs {
-        for f in entry.files() {
-            if is_plain_file_name(f.file) {
-                listed.insert(f.file.to_string());
-            }
-        }
-    }
     for (i, entry) in index.packs.iter().enumerate() {
-        if placeholder_entries.contains(&i) {
-            continue;
-        }
-        let problems = entry.problems(i);
-        if !problems.is_empty() {
-            // Never open a file named by an entry that didn't validate.
-            r.problems.extend(problems);
-            continue;
-        }
-        for f in entry.files() {
-            check_bundle(hub, entry, i, f, opts, r);
+        r.problems.extend(entry.problems(i));
+        // Only files that pass the name check count as listed, and only
+        // they are opened: when the sha256 is a placeholder too there is
+        // nothing to check the bundle against yet.
+        for f in entry.listed_files() {
+            listed.insert(f.file.to_string());
+            if !is_placeholder(f.sha256) {
+                check_bundle(hub, entry, i, f, opts, r);
+            }
         }
     }
     Some(listed)
 }
+
+/// Bundles larger than this are not read into memory by `hub-check`.
+const MAX_HUB_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 
 fn check_bundle(
     hub: &Path,
@@ -747,29 +777,39 @@ fn check_bundle(
     let mut bad = |msg: String| r.problems.push(format!("{at}: {msg}"));
     let path = hub.join("packs").join(f.file);
     match std::fs::symlink_metadata(&path) {
-        Ok(m) if m.file_type().is_file() => {
-            if m.len() != f.size {
-                bad(format!(
-                    "size is {}, but packs[{i}] says {}",
-                    m.len(),
-                    f.size
-                ));
-            }
+        Ok(m) if m.file_type().is_file() && m.len() > MAX_HUB_BUNDLE_BYTES => {
+            return bad(format!("is larger than {MAX_HUB_BUNDLE_BYTES} bytes"));
         }
+        Ok(m) if m.file_type().is_file() => {}
         Ok(_) => return bad("is not a regular file".into()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return bad(format!("is listed in packs[{i}] but missing"));
         }
         Err(e) => return bad(e.to_string()),
     }
-    match sha256_file(&path) {
-        Ok(sum) if sum != f.sha256 => {
-            bad(format!("sha256 is {sum}, but packs[{i}] says {}", f.sha256))
-        }
-        Ok(_) => {}
-        Err(e) => return bad(e.to_string()),
+    // Read once: the size, the hash and the bundle all come from this
+    // buffer, so a file changing under the check can't split them.
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(&path)
+        .and_then(|f| f.take(MAX_HUB_BUNDLE_BYTES + 1).read_to_end(&mut bytes));
+    if let Err(e) = read {
+        return bad(e.to_string());
     }
-    let bundle = match read_bundle(&path) {
+    if bytes.len() as u64 != f.size {
+        bad(format!(
+            "size is {}, but packs[{i}] says {}",
+            bytes.len(),
+            f.size
+        ));
+    }
+    let sum: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if sum != f.sha256 {
+        bad(format!("sha256 is {sum}, but packs[{i}] says {}", f.sha256));
+    }
+    let bundle = match read_bundle_bytes(&bytes) {
         Ok(b) => b,
         Err(e) => return bad(format!("not a readable bundle: {e}")),
     };
@@ -794,16 +834,6 @@ fn check_bundle(
             "packs[{i}] disagrees with the signed manifest: {msg}"
         ));
     }
-}
-
-fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut std::fs::File::open(path)?, &mut hasher)?;
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
 }
 
 /// How an index entry disagrees with the manifest signed inside its bundle.
@@ -902,23 +932,26 @@ fn check_stray_bundles(hub: &Path, listed: &BTreeSet<String>, r: &mut HubReport)
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
-    let mut stray: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "aivyxpack"))
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_none_or(|n| !listed.contains(n))
-        })
-        .collect();
-    stray.sort();
-    for p in stray {
-        r.problems.push(format!(
-            "packs/{}: not listed in {INDEX_PATH}",
-            p.file_name().unwrap_or_default().to_string_lossy()
-        ));
+    let mut lines = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // `file` is a plain name, so a bundle in a subfolder can never be
+        // listed: refuse subfolders outright.
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            lines.push(format!(
+                "packs/{name}/: subfolders are not allowed in packs/"
+            ));
+            continue;
+        }
+        let is_bundle = Path::new(&name)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("aivyxpack"));
+        if is_bundle && !listed.contains(&name) {
+            lines.push(format!("packs/{name}: not listed in {INDEX_PATH}"));
+        }
     }
+    lines.sort();
+    r.problems.extend(lines);
 }
 
 #[cfg(test)]
@@ -951,14 +984,37 @@ mod tests {
     }
 
     #[test]
-    fn placeholders_are_found_in_keys_and_nested_values() {
+    fn placeholders_are_values_starting_with_the_marker() {
         let v: serde_json::Value = serde_json::from_str(
-            r#"{"a": ["ok", "x_Placeholder"], "PLACEHOLDER_KEY": 1, "b": {"c": "fine"}}"#,
+            r#"{"a": ["ok", "PLACEHOLDER_X", "a placeholder in prose", "placeholder_x"],
+                "PLACEHOLDER_KEY": 1, "b": {"c": " PLACEHOLDER"}}"#,
         )
         .unwrap();
         let mut found = Vec::new();
         placeholders(&v, String::new(), &mut found);
         let paths: Vec<_> = found.iter().map(|(p, _)| p.as_str()).collect();
-        assert_eq!(paths, ["PLACEHOLDER_KEY", "a[1]"]);
+        assert_eq!(paths, ["a[1]", "b.c"]);
+    }
+
+    #[test]
+    fn a_key_given_twice_is_refused_anywhere() {
+        // serde_json::Value keeps the last of two equal keys; the index is
+        // never read that way, so no reader sees a different index.
+        for dup in [
+            r#"{"schema_version": 2, "schema_version": 2, "packs": []}"#,
+            r#"{"schema_version": 2, "packs": [], "packs": []}"#,
+            r#"{"schema_version": 2, "packs": [{"name": "a", "name": "b"}]}"#,
+            r#"{"schema_version": 2, "packs": [{"min_version": {"pa": "1.0.0", "pa": "0.1.0"}}]}"#,
+        ] {
+            let err = HubIndex::parse(dup.as_bytes()).unwrap_err().to_string();
+            assert!(err.contains("duplicate field"), "{dup}: {err}");
+        }
+    }
+
+    #[test]
+    fn key_file_comments_never_mark_a_placeholder() {
+        let k = parse_publisher_keys("# PLACEHOLDER: replace before launch\n");
+        assert!(!k.placeholder);
+        assert!(parse_publisher_keys("PLACEHOLDER_NOT_A_REAL_KEY\n").placeholder);
     }
 }

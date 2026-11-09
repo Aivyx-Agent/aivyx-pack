@@ -166,32 +166,50 @@ blank lines, and one base64 Ed25519 verifying key per other line:
 with `✗`, or ends with `✓ hub ok: N packs` (`, index signed` when the
 signature verified). It checks that:
 
-- the manifest parses as schema 2, and every field is well formed;
-- nothing in it contains `PLACEHOLDER` (any case);
+- the manifest parses as schema 2, with no key given twice anywhere, and
+  every field is well formed;
+- no value in it is a placeholder: a string starting with `PLACEHOLDER`
+  (exact case; prose that mentions the word is fine);
 - each listed bundle exists, has the listed size and sha256, is signed by a
   built-in publisher key (`AIVYX_PUBLISHER_KEYS`; `--trust` adds one), and
   its signed manifest agrees with the entry on name, version, format,
-  products and each `min_version` (and target, for format 1);
-- every `.aivyxpack` in `packs/` is listed;
+  products and each `min_version` (and target, for format 1). The bundle is
+  read once, and size, hash and signature are all checked on those bytes;
+- every `.aivyxpack` in `packs/` (any case) is listed, and `packs/` has no
+  subfolders;
 - `publisher-key.txt` has at least one key, every key line is a valid key,
   and, once `AIVYX_PUBLISHER_KEYS` is filled, its keys are exactly that list;
-- `packs/index.json.sig`, if present, verifies against a key in
-  `publisher-key.txt`. `--require-signature` makes its absence a problem.
+- `packs/index.json.sig`, if present, verifies (strict Ed25519) against a
+  key in `publisher-key.txt`. `--require-signature` makes its absence a
+  problem.
 
 `--allow-placeholders` turns placeholders into `! warning:` lines, for
-pre-launch builds: an entry with a placeholder skips its other checks, and a
-placeholder `publisher-key.txt` is accepted only while
-`AIVYX_PUBLISHER_KEYS` is empty.
+pre-launch builds. A placeholder excuses only its own field: every other
+check still runs, and the bundle is checked whenever `file` and `sha256` are
+real. A placeholder `publisher-key.txt` (a non-comment line starting with
+`PLACEHOLDER`) is accepted only while `AIVYX_PUBLISHER_KEYS` is empty.
 
-`--site-dist <dir>` also scans every `.html` file under the built site (often
-the same folder) for what the Hub's Content-Security-Policy
-(`script-src 'self'; style-src 'self'`) would break and for leaks: a
-`<script>` without `src`, a `<style>` element or a `style="…"` attribute, and
-any attribute linking `github.com/Aivyx-Agent/<private repo>` (aivyx-hub,
-aivyx-verticals, aivyx-ecosystem, aivyx-website, aivyx-brand,
-aivyx-wallpapers, aivyx-coder-bench, aivyx-coder-samples, aivyx-deploy; any
-case, `www.` or not). Each line names the file, the line and an excerpt.
-Comments are skipped.
+`--site-dist <dir>` also scans every `.html`, `.htm`, `.xhtml` and `.svg`
+file under the built site (often the same folder) for what the Hub's
+Content-Security-Policy (`script-src 'self'; style-src 'self'`) would break
+and for leaks. A folder with no such file fails. It flags:
+
+- a `<script>` without a `src` (or with an empty one), of any type; a
+  non-JavaScript type, such as JSON-LD, is reported as an inline data
+  script to serve as a file;
+- a `<style>` element or a `style="…"` attribute;
+- an inline event handler attribute (`onclick=` and the like) and any
+  `javascript:` URL;
+- any link to `github.com/Aivyx-Agent/<private repo>` or
+  `raw.githubusercontent.com/Aivyx-Agent/<private repo>`, in an attribute,
+  in text, or in a script or style body. The private repos are aivyx-hub,
+  aivyx-verticals, aivyx-ecosystem, aivyx-website, aivyx-brand,
+  aivyx-wallpapers, aivyx-coder-bench, aivyx-coder-samples and
+  aivyx-deploy. Matching ignores case and catches `www.`; character
+  references (`&#47;`, `&#x2F;`, `&sol;`, `&period;`, `&colon;`, `&amp;`)
+  are decoded first.
+
+Each line names the file, the line and an excerpt. Comments are skipped.
 
 **`hub-sign <dir>`** signs the exact bytes of `packs/index.json` and writes
 the base64 signature to `packs/index.json.sig`. The index must parse as
