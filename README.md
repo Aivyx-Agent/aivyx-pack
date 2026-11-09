@@ -185,8 +185,8 @@ signature verified). It checks that:
 
 `--allow-placeholders` turns placeholders into `! warning:` lines, for
 pre-launch builds. A placeholder excuses only its own field: every other
-check still runs, and the bundle is checked whenever `file` and `sha256` are
-real. A placeholder `publisher-key.txt` (a non-comment line starting with
+check still runs, and a bundle with a real `file` is always checked (a
+placeholder `sha256` skips only the hash comparison). A placeholder `publisher-key.txt` (a non-comment line starting with
 `PLACEHOLDER`) is accepted only while `AIVYX_PUBLISHER_KEYS` is empty.
 
 `--site-dist <dir>` also scans every `.html`, `.htm`, `.xhtml` and `.svg`
@@ -198,8 +198,10 @@ and for leaks. A folder with no such file fails. It flags:
   non-JavaScript type, such as JSON-LD, is reported as an inline data
   script to serve as a file;
 - a `<style>` element or a `style="…"` attribute;
-- an inline event handler attribute (`onclick=` and the like) and any
-  `javascript:` URL;
+- an inline event handler attribute (`onclick=` and the like), and a
+  `javascript:` URL in a URL attribute (`href`, `src`, `action`,
+  `formaction`, `xlink:href`, `data`, `poster`, `cite`, `background`,
+  `srcset`);
 - any link to `github.com/Aivyx-Agent/<private repo>` or
   `raw.githubusercontent.com/Aivyx-Agent/<private repo>`, in an attribute,
   in text, or in a script or style body. The private repos are aivyx-hub,

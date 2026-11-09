@@ -750,13 +750,11 @@ fn check_index(
     for (i, entry) in index.packs.iter().enumerate() {
         r.problems.extend(entry.problems(i));
         // Only files that pass the name check count as listed, and only
-        // they are opened: when the sha256 is a placeholder too there is
-        // nothing to check the bundle against yet.
+        // they are opened. A placeholder sha256 skips just the hash
+        // comparison: size, signature and manifest are still checked.
         for f in entry.listed_files() {
             listed.insert(f.file.to_string());
-            if !is_placeholder(f.sha256) {
-                check_bundle(hub, entry, i, f, opts, r);
-            }
+            check_bundle(hub, entry, i, f, opts, r);
         }
     }
     Some(listed)
@@ -806,7 +804,7 @@ fn check_bundle(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    if sum != f.sha256 {
+    if !is_placeholder(f.sha256) && sum != f.sha256 {
         bad(format!("sha256 is {sum}, but packs[{i}] says {}", f.sha256));
     }
     let bundle = match read_bundle_bytes(&bytes) {

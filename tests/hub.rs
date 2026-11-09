@@ -328,6 +328,34 @@ fn placeholders_fail_unless_allowed() {
 }
 
 #[test]
+fn a_placeholder_sha256_still_checks_size_signature_and_manifest() {
+    let hub = Hub::new("placeholder-sha");
+    // Re-signed by a key that isn't built in; listed with a placeholder hash.
+    let path = hub.dir.join("packs").join(FILE);
+    let payload = aivyx_pack::read_bundle(&path).unwrap().payload;
+    write_bundle(&payload, &SigningKey::from_bytes(&rand::random()), &path).unwrap();
+    hub.edit(|e| {
+        e["sha256"] = "PLACEHOLDER_NOT_YET_SIGNED".into();
+        e["min_version"]["pa"] = "2.0.0".into();
+        e["size"] = 1.into();
+    });
+    let r = hub.check_with(|o| o.allow_placeholders = true);
+    assert_eq!(r.warnings.len(), 1, "{:#?}", r.warnings);
+    let problems = r.problems.join("\n");
+    assert_eq!(r.problems.len(), 3, "{problems}");
+    assert!(problems.contains("size is "), "{problems}");
+    assert!(
+        problems.contains("not a built-in publisher key"),
+        "{problems}"
+    );
+    assert!(
+        problems.contains("min_version.pa is Some(\"2.0.0\")"),
+        "{problems}"
+    );
+    assert!(!problems.contains("sha256 is "), "{problems}");
+}
+
+#[test]
 fn a_placeholder_suppresses_only_its_own_field() {
     // A placeholder description doesn't excuse a wrong sha256.
     let hub = Hub::new("placeholder-narrow");

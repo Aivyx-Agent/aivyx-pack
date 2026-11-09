@@ -210,7 +210,7 @@ pub fn scan_html(html: &str) -> Vec<(usize, String)> {
                     format!("inline event handler {name}= (CSP script-src 'self' blocks it): {ex}"),
                 ));
             }
-            if is_javascript_url(&value) {
+            if is_url_attr(name) && url_values(name, &value).any(is_javascript_url) {
                 out.push((line, format!("{name} is a javascript: URL: {ex}")));
             }
             for (repo, _) in private_repo_links(&value) {
@@ -234,6 +234,38 @@ pub fn scan_html(html: &str) -> Vec<(usize, String)> {
         }
     }
     out
+}
+
+/// Attributes whose value is a URL (or, for `srcset`, a list of them).
+const URL_ATTRS: &[&str] = &[
+    "href",
+    "src",
+    "action",
+    "formaction",
+    "xlink:href",
+    "data",
+    "poster",
+    "cite",
+    "background",
+    "srcset",
+];
+
+fn is_url_attr(name: &str) -> bool {
+    URL_ATTRS.contains(&name)
+}
+
+/// The URLs in a URL attribute's value: the value itself, or for `srcset`
+/// the first word of each comma-separated candidate.
+fn url_values<'a>(name: &str, value: &'a str) -> Box<dyn Iterator<Item = &'a str> + 'a> {
+    if name == "srcset" {
+        Box::new(
+            value
+                .split(',')
+                .map(|c| c.split_whitespace().next().unwrap_or("")),
+        )
+    } else {
+        Box::new(std::iter::once(value))
+    }
 }
 
 /// A `javascript:` URL, as a browser reads it: ASCII whitespace and control
@@ -364,7 +396,14 @@ pub fn decode_entities(s: &str) -> String {
             }
         } else if let Some((name, c)) = NAMED
             .iter()
-            .find(|(n, _)| after.len() >= n.len() && after[..n.len()].eq_ignore_ascii_case(n))
+            // Compare bytes: `after` may start with a multibyte character,
+            // so it is sliced only after an (ASCII) name has matched.
+            .find(|(n, _)| {
+                after
+                    .as_bytes()
+                    .get(..n.len())
+                    .is_some_and(|b| b.eq_ignore_ascii_case(n.as_bytes()))
+            })
         {
             out.push(*c);
             rest = &after[name.len()..];
@@ -400,7 +439,10 @@ pub fn private_repo_links(text: &str) -> Vec<(&'static str, usize)> {
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
                 .collect();
-            let name = name.strip_suffix(".git").unwrap_or(&name);
+            // Prose punctuation after a link (`…/aivyx-hub.`) is not part of
+            // the name.
+            let name = name.trim_end_matches(['.', ',', ')', ']', '"', '\'']);
+            let name = name.strip_suffix(".git").unwrap_or(name);
             if let Some(repo) = PRIVATE_REPOS.iter().find(|r| **r == name) {
                 found.push((*repo, at));
             }
@@ -428,6 +470,9 @@ mod tests {
             "https://github.com/Aivyx-Agent/aivyx-deploy.git",
             "https://github.com/Aivyx-Agent/aivyx-coder-bench?tab=readme",
             "https://raw.githubusercontent.com/Aivyx-Agent/aivyx-brand/main/logo.svg",
+            "see https://github.com/Aivyx-Agent/aivyx-hub.",
+            "(github.com/Aivyx-Agent/aivyx-hub.git),",
+            "github.com/Aivyx-Agent/aivyx-hub...",
         ] {
             assert!(private_repo_link(hit).is_some(), "{hit}");
         }
@@ -453,6 +498,88 @@ mod tests {
             "&#47; &bogus; &#; & &#x;"
         );
         assert_eq!(decode_entities("caf\u{e9} &#233;"), "caf\u{e9} \u{e9}");
+    }
+
+    #[test]
+    fn non_ascii_after_an_ampersand_never_panics() {
+        for (input, want) in [
+            ("Smith&Co\u{e9}", "Smith&Co\u{e9}"),
+            ("R&D\u{e9}", "R&D\u{e9}"),
+            ("M\u{fc}ller&S\u{f6}hne", "M\u{fc}ller&S\u{f6}hne"),
+            ("&\u{e9}", "&\u{e9}"),
+            ("a&", "a&"),
+            ("a&#", "a&#"),
+            ("&#x", "&#x"),
+            ("&#xZZ;", "&#xZZ;"),
+            ("&#99999999;", "&#99999999;"),
+            ("&#99999999999999999999;", "&#99999999999999999999;"),
+            ("&#x110000;", "&#x110000;"),
+        ] {
+            assert_eq!(decode_entities(input), want, "{input:?}");
+        }
+        for page in [
+            "<p>Smith&Co\u{e9}</p>",
+            "<a title=\"R&D\u{e9}\">",
+            "<p>M\u{fc}ller&S\u{f6}hne&",
+        ] {
+            assert!(scan_html(page).is_empty(), "{page:?}");
+        }
+    }
+
+    #[test]
+    fn scan_html_never_panics_on_random_input() {
+        // A small xorshift, seeded, so a failure is reproducible.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        const PIECES: &[&str] = &[
+            "&",
+            "<",
+            ">",
+            "\"",
+            "'",
+            "=",
+            "#",
+            "x",
+            ";",
+            "/",
+            "-",
+            " ",
+            "\n",
+            "\u{e9}",
+            "\u{fc}",
+            "\u{4e2d}",
+            "\u{1f600}",
+            "&#",
+            "&#x",
+            "&amp",
+            "&sol",
+            "<!--",
+            "-->",
+            "<script",
+            "</script",
+            "<style",
+            "<a href=",
+            "style=",
+            "onclick=",
+            "javascript:",
+            "github.com/Aivyx-Agent/aivyx-hub",
+            "1",
+            "F",
+        ];
+        for _ in 0..500 {
+            let len = (next() % 40) as usize;
+            let input: String = (0..len)
+                .map(|_| PIECES[(next() % PIECES.len() as u64) as usize])
+                .collect();
+            let _ = scan_html(&input);
+            let _ = decode_entities(&input);
+            let _ = private_repo_links(&input);
+        }
     }
 
     #[test]
@@ -506,6 +633,13 @@ mod tests {
         );
         let found = lines("<a href=\"java&#115;cript:go()\">");
         assert!(found[0].contains("href is a javascript: URL"), "{found:?}");
+        // Only URL attributes: prose that starts with "JavaScript:" is fine.
+        assert!(lines("<meta name=description content=\"JavaScript: tips\">").is_empty());
+        let found = lines("<img srcset=\"/a.png 1x, javascript:x 2x\">");
+        assert!(
+            found[0].contains("srcset is a javascript: URL"),
+            "{found:?}"
+        );
         // `on` alone and names merely containing it are fine.
         assert!(lines("<x on=\"1\" data-on=\"2\">").is_empty());
     }
