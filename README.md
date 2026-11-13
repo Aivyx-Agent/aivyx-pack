@@ -1,5 +1,7 @@
 # aivyx-pack
 
+Part of the [Aivyx Ecosystem](https://aivyx-ecosystem.com/building-blocks/): a shared building block of [Aivyx PA](https://aivyx-ecosystem.com/pa/) and [aivyx-coder](https://aivyx-ecosystem.com/coder/).
+
 The signed bundle format for **Aivyx vertical packs** — shared by
 [aivyx-pa](https://github.com/Aivyx-Agent/aivyx-pa) and
 [aivyx-coder](https://github.com/Aivyx-Agent/aivyx-coder), so both verify
