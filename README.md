@@ -180,7 +180,7 @@ signature verified). It checks that:
 - every `.aivyxpack` in `packs/` (any case) is listed, and `packs/` has no
   subfolders;
 - `publisher-key.txt` has at least one key, every key line is a valid key,
-  and, once `AIVYX_PUBLISHER_KEYS` is filled, its keys are exactly that list;
+  and its keys are exactly the `AIVYX_PUBLISHER_KEYS` list;
 - `packs/index.json.sig`, if present, verifies (strict Ed25519) against a
   key in `publisher-key.txt`. `--require-signature` makes its absence a
   problem.
@@ -189,7 +189,9 @@ signature verified). It checks that:
 pre-launch builds. A placeholder excuses only its own field: every other
 check still runs, and a bundle with a real `file` is always checked (a
 placeholder `sha256` skips only the hash comparison). A placeholder `publisher-key.txt` (a non-comment line starting with
-`PLACEHOLDER`) is accepted only while `AIVYX_PUBLISHER_KEYS` is empty.
+`PLACEHOLDER`) was accepted only while `AIVYX_PUBLISHER_KEYS` was empty;
+it holds the primary and backup keys now, so a placeholder file is always a
+problem.
 
 `--site-dist <dir>` also scans every `.html`, `.htm`, `.xhtml` and `.svg`
 file under the built site (often the same folder) for what the Hub's

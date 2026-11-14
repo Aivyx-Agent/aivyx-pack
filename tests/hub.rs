@@ -7,7 +7,7 @@ use aivyx_pack::hub::{
     HubCheckOptions, HubIndex, HubReport, hub_check, parse_publisher_keys, sign_hub_index,
     verify_hub_index,
 };
-use aivyx_pack::{build_payload, encode_verifying_key, write_bundle};
+use aivyx_pack::{AIVYX_PUBLISHER_KEYS, build_payload, encode_verifying_key, write_bundle};
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
@@ -587,7 +587,7 @@ fn the_commands_end_to_end() {
     let keyfile = hub.dir.parent().unwrap().join("key.bin");
     std::fs::write(&keyfile, hub.key.to_bytes()).unwrap();
 
-    // AIVYX_PUBLISHER_KEYS is empty, so the bundle needs --trust.
+    // The test key isn't one of AIVYX_PUBLISHER_KEYS, so the bundle needs --trust.
     let out = bin().args(["hub-check", s(&hub.dir)]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "{stdout}");
@@ -622,9 +622,28 @@ fn the_commands_end_to_end() {
         ])
         .output()
         .unwrap();
+    // Everything else now passes, but the binary checks publisher-key.txt
+    // against the real AIVYX_PUBLISHER_KEYS, which the test key isn't
+    // (the library tests inject their own built-in key for the passing case).
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "{stdout}");
-    assert_eq!(stdout.trim(), "\u{2713} hub ok: 1 packs, index signed");
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    let problems: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with('\u{2717}'))
+        .collect();
+    assert_eq!(problems.len(), 1 + AIVYX_PUBLISHER_KEYS.len(), "{stdout}");
+    assert!(
+        problems[0].contains(&hub.pubkey) && problems[0].contains("not a built-in"),
+        "{stdout}"
+    );
+    for key in AIVYX_PUBLISHER_KEYS {
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("missing") && p.contains(key)),
+            "{stdout}"
+        );
+    }
 }
 
 #[test]

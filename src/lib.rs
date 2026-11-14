@@ -40,12 +40,21 @@ pub mod hub;
 pub mod yubikey;
 
 /// Compiled-in Aivyx publisher verifying keys (base64), shared by every
-/// Aivyx product that installs packs. Empty until the
-/// v1.0 web presence establishes the real publisher key ceremony — an
-/// empty set means only operator-configured `[pack] trusted_publishers`
-/// verify. Deliberately NOT a placeholder key: a placeholder anyone can
-/// read is worse than none.
-pub const AIVYX_PUBLISHER_KEYS: &[&str] = &[];
+/// Aivyx product that installs packs, so a first-party pack verifies with
+/// no `[pack] trusted_publishers` entry. Both are Ed25519 file keys made
+/// with `aivyx-pack keygen` on 2026-11-14:
+///
+/// - the primary, which signs every Aivyx pack and the Hub index;
+/// - the backup, kept offline, to sign with if the primary is lost.
+///
+/// Rotating or retiring one is a release of this crate and of every product
+/// that pins it. `aivyx-hub/public/publisher-key.txt` lists the same keys.
+pub const AIVYX_PUBLISHER_KEYS: &[&str] = &[
+    // primary
+    "Ta+C9kWrUkn4w1jIx8av0kQpShaz1SA6sgVmihIjqzQ=",
+    // backup (offline)
+    "8fnHdBUhZAcY37lr0gTiScoRaJepnI5H1kHAvJ28Q0s=",
+];
 
 /// The target triple this binary was built for (relayed by build.rs) —
 /// `pack install` refuses bundles built for a foreign platform.
