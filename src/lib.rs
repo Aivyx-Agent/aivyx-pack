@@ -34,6 +34,7 @@ use thiserror::Error;
 mod config_pack;
 pub use config_pack::{CoderPart, CoderSettings, PackVerification, check_coder_settings, ConfigPackManifest, PaPart, Product};
 pub use checks::{CHECKS_FILE, Checks, load_checks, run_checks};
+pub mod check;
 pub mod checks;
 pub mod describe;
 pub mod hub;

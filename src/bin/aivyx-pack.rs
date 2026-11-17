@@ -19,6 +19,7 @@ const USAGE: &str = "usage:
   aivyx-pack build <staging-dir> --yubikey [--serial <serial>] --out <file>
   aivyx-pack yubikey-init [--serial <serial>] [--overwrite-existing-key]
   aivyx-pack inspect <file> [--trust <base64-key>]... [--allow-untrusted]
+  aivyx-pack check <dir> [--allow-unchecked]
   aivyx-pack hub-check <hub-public-dir> [--trust <base64-key>]... [--allow-placeholders]
                        [--require-signature] [--site-dist <dir>]
   aivyx-pack hub-sign <hub-public-dir> --key <keyfile>
@@ -41,6 +42,7 @@ enum Command {
     Build { staging: String, signer: Signer, out: String },
     YubikeyInit { serial: Option<String>, overwrite_existing_key: bool },
     Inspect { file: String, trust: Vec<String>, allow_untrusted: bool },
+    Check { dir: String, allow_unchecked: bool },
     HubCheck {
         dir: String,
         trust: Vec<String>,
@@ -214,6 +216,17 @@ fn parse(args: &[String]) -> Result<Command, String> {
             };
             Ok(Command::HubSign { dir: dir.to_string(), signer })
         }
+        ["check", dir, rest @ ..] => {
+            let dir = operand("pack dir", dir)?.to_string();
+            let mut allow_unchecked = false;
+            for flag in rest {
+                match *flag {
+                    "--allow-unchecked" => allow_unchecked = true,
+                    other => return Err(format!("unknown option {other}")),
+                }
+            }
+            Ok(Command::Check { dir, allow_unchecked })
+        }
         _ => Err("unknown command".into()),
     }
 }
@@ -271,6 +284,16 @@ fn run(cmd: Command) -> Result<(), String> {
             }
             let manifest = read_any_manifest(&bundle.payload).map_err(err)?;
             print!("{}", describe::describe(&manifest));
+        }
+        Command::Check { dir, allow_unchecked } => {
+            let steps = aivyx_pack::check::check_dir(
+                Path::new(&dir),
+                &aivyx_pack::check::CheckOptions { allow_unchecked },
+            );
+            print!("{}", aivyx_pack::check::render(&steps));
+            if !aivyx_pack::check::passed(&steps) {
+                return Err("the pack has problems (see above)".into());
+            }
         }
         Command::HubCheck { dir, trust, allow_placeholders, require_signature, site_dist } => {
             let opts = HubCheckOptions {
