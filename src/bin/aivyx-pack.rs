@@ -333,9 +333,19 @@ fn run(cmd: Command) -> Result<(), String> {
                 s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect()
             };
             let path = Path::new(&dir);
-            let name = name.unwrap_or_else(|| {
-                path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-            });
+            let name = match name {
+                Some(n) => n,
+                None => {
+                    let last = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+                    // `.`, `..` and `/` have no final component: resolve the folder.
+                    last(path)
+                        .or_else(|| {
+                            std::fs::create_dir_all(path).ok()?;
+                            last(&std::fs::canonicalize(path).ok()?)
+                        })
+                        .ok_or_else(|| format!("pass --name: {dir} has no folder name"))?
+                }
+            };
             let products = products.unwrap_or_else(|| ask("products (pa, coder or pa,coder)", "pa,coder"));
             let products = split(&products)
                 .iter()

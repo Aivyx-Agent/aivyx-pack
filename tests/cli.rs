@@ -356,3 +356,21 @@ fn new_writes_a_pack_that_checks() {
     let again = bin().args(["new"]).arg(&pack).args(["--products", "coder"]).output().unwrap();
     assert!(!again.status.success(), "a non-empty folder is refused");
 }
+
+#[test]
+fn new_dot_takes_the_name_from_the_current_folder() {
+    let dir = tempdir("new-dot");
+    let pack = dir.join("dotted-pack");
+    std::fs::create_dir_all(&pack).unwrap();
+    let out = bin()
+        .args(["new", ".", "--products", "coder", "--publisher", "Aivyx"])
+        .current_dir(&pack)
+        .env_remove("AIVYX_CODER")
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text} {}", String::from_utf8_lossy(&out.stderr));
+    let manifest = std::fs::read_to_string(pack.join("manifest.toml")).unwrap();
+    assert!(manifest.contains("name = \"dotted-pack\""), "{manifest}");
+}

@@ -148,6 +148,11 @@ pub fn scaffold(dir: &Path, o: &NewOptions) -> Result<(), String> {
     write(dir, CHECKS_FILE, &checks_text(o))?;
     if o.products.contains(&Product::Pa) {
         for (rel, text) in PA_FILES {
+            if *rel == "pa/team.toml" {
+                let line = format!("name = {}", quoted(&o.name));
+                write(dir, rel, &text.replacen("name = \"pa-base\"", &line, 1))?;
+                continue;
+            }
             write(dir, rel, text)?;
         }
     }
@@ -204,6 +209,11 @@ mod tests {
                 "{tag}"
             );
             crate::build_payload(&dir).unwrap();
+            if tag != "coder" {
+                let team = std::fs::read_to_string(dir.join("pa/team.toml")).unwrap();
+                assert!(team.contains("name = \"my-pack\""), "{tag}: {team}");
+                assert!(!team.contains("pa-base"), "{tag}: {team}");
+            }
             std::fs::remove_dir_all(&dir).ok();
         }
     }
