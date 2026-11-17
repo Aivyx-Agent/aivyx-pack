@@ -202,15 +202,17 @@ fn coder_pack(dir: &Path) {
 }
 
 /// A fake product: prints a version, and passes `pack check`/`pack inspect`.
-fn fake_product(dir: &Path, version: &str, check_ok: bool) -> PathBuf {
+fn fake_product(dir: &Path, version: &str, check_ok: bool, inspect_ok: bool) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join("fake-product");
     let status = if check_ok { 0 } else { 1 };
+    let inspect = if inspect_ok { 0 } else { 1 };
     std::fs::write(
         &path,
         format!(
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"aivyx-coder {version}\"; exit 0; fi\n\
-             if [ \"$2\" = \"check\" ]; then echo \"fake check\"; exit {status}; fi\nexit 0\n"
+             if [ \"$2\" = \"check\" ]; then echo \"fake check\"; exit {status}; fi\n\
+             if [ \"$2\" = \"inspect\" ]; then exit {inspect}; fi\nexit 0\n"
         ),
     )
     .unwrap();
@@ -222,11 +224,12 @@ fn fake_product(dir: &Path, version: &str, check_ok: bool) -> PathBuf {
 fn check_passes_a_good_pack_and_notes_an_old_product() {
     let dir = tempdir("check-ok");
     coder_pack(&dir.join("pack"));
-    let fake = fake_product(&dir, "1.0.0", true);
+    let fake = fake_product(&dir, "1.0.0", true, true);
     let out = bin().args(["check"]).arg(dir.join("pack")).env("AIVYX_CODER", &fake).output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{text}");
     assert!(text.contains("checked without tool lints (aivyx-coder < 1.1.0)"), "{text}");
+    assert!(text.contains("aivyx-coder reads the built bundle"), "{text}");
     assert!(text.contains("The pack passes."), "{text}");
 }
 
@@ -234,7 +237,7 @@ fn check_passes_a_good_pack_and_notes_an_old_product() {
 fn check_fails_when_the_product_check_fails() {
     let dir = tempdir("check-product-fails");
     coder_pack(&dir.join("pack"));
-    let fake = fake_product(&dir, "1.1.0", false);
+    let fake = fake_product(&dir, "1.1.0", false, true);
     let out = bin().args(["check"]).arg(dir.join("pack")).env("AIVYX_CODER", &fake).output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("aivyx-coder pack check found problems"));
@@ -246,8 +249,12 @@ fn check_without_the_product_fails_unless_allowed() {
     coder_pack(&dir.join("pack"));
     let missing = dir.join("no-such-binary");
     let out = bin().args(["check"]).arg(dir.join("pack")).env("AIVYX_CODER", &missing).env("PATH", "").output().unwrap();
-    // AIVYX_CODER names a path that doesn't exist: running it fails.
+    // AIVYX_CODER names a path that doesn't exist: running it fails, once,
+    // with the real reason.
     assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(text.matches("couldn't run").count(), 1, "{text}");
+    assert!(text.contains("No such file"), "{text}");
     let out = bin()
         .args(["check"])
         .arg(dir.join("pack"))
@@ -267,7 +274,7 @@ fn check_reports_a_broken_promise() {
     let pack = dir.join("pack");
     coder_pack(&pack);
     std::fs::write(pack.join("checks.toml"), "[coder]\nskills = [\"tidy\", \"gone\"]\n").unwrap();
-    let fake = fake_product(&dir, "1.1.0", true);
+    let fake = fake_product(&dir, "1.1.0", true, true);
     let out = bin().args(["check"]).arg(&pack).env("AIVYX_CODER", &fake).output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("coder skills: missing [\"gone\"]"));
@@ -287,4 +294,43 @@ fn a_built_bundle_never_holds_checks_toml() {
         .collect();
     assert!(!names.iter().any(|n| n.contains("checks.toml")), "{names:?}");
     assert!(names.iter().any(|n| n == "manifest.toml"), "{names:?}");
+}
+
+#[test]
+fn check_fails_when_the_product_cant_read_the_built_bundle() {
+    let dir = tempdir("check-inspect-fails");
+    coder_pack(&dir.join("pack"));
+    let fake = fake_product(&dir, "1.1.0", true, false);
+    let out = bin()
+        .args(["check"])
+        .arg(dir.join("pack"))
+        .env("AIVYX_CODER", &fake)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("aivyx-coder can't read the built bundle"), "{text}");
+}
+
+#[test]
+fn check_fails_on_a_tool_pack_or_a_missing_manifest() {
+    let dir = tempdir("check-format");
+    let empty = dir.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = bin().args(["check"]).arg(&empty).output().unwrap();
+    assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("can't read manifest.toml"), "{text}");
+
+    let tool = dir.join("tool");
+    std::fs::create_dir_all(&tool).unwrap();
+    std::fs::write(
+        tool.join("manifest.toml"),
+        "format = 1\nname = \"t\"\nversion = \"0.1.0\"\npublisher = \"Aivyx\"\ntarget = \"linux-x86_64\"\nmin_daemon_version = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let out = bin().args(["check"]).arg(&tool).output().unwrap();
+    assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("tool pack (format 1)"), "{text}");
 }
