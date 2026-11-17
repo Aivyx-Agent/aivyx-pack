@@ -38,6 +38,7 @@ pub mod check;
 pub mod checks;
 pub mod describe;
 pub mod hub;
+pub mod scaffold;
 #[cfg(feature = "yubikey")]
 #[doc(hidden)]
 pub mod yubikey;

@@ -78,6 +78,8 @@ aivyx-pack build <staging-dir> --key <keyfile> --out <file>
 aivyx-pack build <staging-dir> --yubikey [--serial <serial>] --out <file>
 aivyx-pack yubikey-init [--serial <serial>] [--overwrite-existing-key]   # put a pack key on a YubiKey
 aivyx-pack inspect <file> [--trust <base64-key>]... [--allow-untrusted]
+aivyx-pack new <dir> [--name <name>] [--products pa,coder] [--publisher <name>]   # see below
+aivyx-pack check <dir> [--allow-unchecked]
 aivyx-pack hub-check <hub-public-dir> [--trust <base64-key>]... [--allow-placeholders]
                      [--require-signature] [--site-dist <dir>]
 aivyx-pack hub-sign <hub-public-dir> --key <keyfile>
@@ -110,6 +112,63 @@ in hardware, in the Signature slot of a YubiKey's OpenPGP applet:
 A card has one Signature slot. A card that holds a pack key must hold only
 that key: never put `aivyx-pa`'s federation identity key on the same card.
 Without the feature, `--yubikey` and `yubikey-init` exit 2 and say so.
+
+## Making a pack: `new` and `check`
+
+```
+aivyx-pack new <dir> [--name <name>] [--products pa,coder] [--publisher <name>]
+                     [--requires <a,b>] [--optional <a,b>]
+aivyx-pack check <dir> [--allow-unchecked]
+```
+
+`new` writes a format-2 config pack into a new or empty folder: a
+`manifest.toml` (version `0.1.0`, `min_version = "1.0.0"` for each product,
+publisher `Aivyx` unless you say otherwise), the starter files for each
+product from templates built into the binary, and a starter `checks.toml`.
+It asks for the products and publisher only when stdin is a terminal, refuses
+a folder that isn't empty, and ends by running `check --allow-unchecked`.
+
+`check` runs four steps and prints one report: the manifest and its files
+(the format check), each product's own `pack check` on the pack, the pack's
+`checks.toml`, and a trial build. The products are run as binaries: the path
+in `AIVYX_PA` / `AIVYX_CODER` when set and non-empty, else `aivyx-pa` /
+`aivyx-coder` on `PATH`. A product that can't be found fails the check unless
+you pass `--allow-unchecked`, which notes it and goes on; a named product that
+can't be run is always an error. The product tool lints need `aivyx-pa` 1.2.0
+and `aivyx-coder` 1.1.0; an older product is noted (`checked without tool
+lints`), not failed.
+
+### `checks.toml`
+
+The pack's own promises, at the pack root beside `manifest.toml`. It is never
+in a bundle. Every key is optional; an unknown key or table is an error. Text
+rules (`mentions`, `forbids`) match case-insensitively with runs of
+whitespace collapsed, and an empty text is reported.
+
+Top level:
+
+- `sections`: sections every skill must have (`When` means a `**When:**` line, then `Steps`, `Never`, and so on). A skill folder without a readable `SKILL.md` is a problem.
+
+`[pa]`:
+
+- `skills`: exactly these skills.
+- `forbid_tools`: tools in no allowlist and named in no skill.
+- `autonomy`: the template's `[autonomy] level`.
+- `supervised`: exactly these `[[autonomy.override]]` areas, each at `supervised`.
+- `least_privilege`: every team member but the lead holds only tools named by the skills it `runs_on`, plus the team tools and `skill_defaults.*`.
+- `routine_names`: exactly these `[[schedule]]` routines.
+- `[pa.roles.<name>]` `mentions`: text in the role's `system_prompt`.
+- `[pa.skill.<name>]`: `runs_on` (members or `role:<name>` that between them hold every tool the skill names), `mentions`, `forbids`, and `sections` (replaces the top-level list for this skill).
+- `[pa.routines.<name>]`: `cron`; `team_mission` (a goal, no `prompt` or `role`, no `pack_config`); `mentions` (in the goal or prompt).
+- `[pa.team]`: `name`, `lead`, `members` (exactly these), `every_member_holds`, `every_member_scopes`.
+- `[pa.team.member.<name>]`: `holds` (at least these tools), `holds_only` (at most these, team tools always allowed), `forbid_tools`, `scopes_only` (for each scope base named, exactly these scopes), `forbid_scope_prefixes`.
+
+`[coder]`:
+
+- `skills`: exactly these skills.
+- `forbid_in_steps`: tool names backticked in no skill's `**Steps:**` section.
+- `agents_mentions`: text in `AGENTS.md`.
+- `[coder.skill.<name>]`: `mentions`, `forbids`, `sections`.
 
 ## The Hub: `hub-check` and `hub-sign`
 

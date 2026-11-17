@@ -14,6 +14,7 @@ use aivyx_pack::{
 };
 
 const USAGE: &str = "usage:
+  aivyx-pack new <dir> [--name <name>] [--products pa,coder] [--publisher <name>] [--requires <a,b>] [--optional <a,b>]
   aivyx-pack keygen <keyfile>
   aivyx-pack build <staging-dir> --key <keyfile> --out <file>
   aivyx-pack build <staging-dir> --yubikey [--serial <serial>] --out <file>
@@ -43,6 +44,7 @@ enum Command {
     YubikeyInit { serial: Option<String>, overwrite_existing_key: bool },
     Inspect { file: String, trust: Vec<String>, allow_untrusted: bool },
     Check { dir: String, allow_unchecked: bool },
+    New { dir: String, name: Option<String>, products: Option<String>, publisher: Option<String>, requires: Option<String>, optional: Option<String> },
     HubCheck {
         dir: String,
         trust: Vec<String>,
@@ -227,6 +229,26 @@ fn parse(args: &[String]) -> Result<Command, String> {
             }
             Ok(Command::Check { dir, allow_unchecked })
         }
+        ["new", dir, rest @ ..] => {
+            let dir = operand("pack dir", dir)?.to_string();
+            let (mut name, mut products, mut publisher, mut requires, mut optional) = (None, None, None, None, None);
+            let mut it = rest.iter();
+            while let Some(flag) = it.next() {
+                if !matches!(*flag, "--name" | "--products" | "--publisher" | "--requires" | "--optional") {
+                    return Err(format!("unknown option {flag}"));
+                }
+                let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
+                let value = Some(operand(&format!("the value of {flag}:"), value)?.to_string());
+                match *flag {
+                    "--name" => name = value,
+                    "--products" => products = value,
+                    "--publisher" => publisher = value,
+                    "--requires" => requires = value,
+                    _ => optional = value,
+                }
+            }
+            Ok(Command::New { dir, name, products, publisher, requires, optional })
+        }
         _ => Err("unknown command".into()),
     }
 }
@@ -294,6 +316,51 @@ fn run(cmd: Command) -> Result<(), String> {
             if !aivyx_pack::check::passed(&steps) {
                 return Err("the pack has problems (see above)".into());
             }
+        }
+        Command::New { dir, name, products, publisher, requires, optional } => {
+            use std::io::IsTerminal;
+            let ask = |question: &str, default: &str| -> String {
+                if !std::io::stdin().is_terminal() {
+                    return default.to_string();
+                }
+                eprint!("{question} [{default}]: ");
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                let line = line.trim();
+                if line.is_empty() { default.to_string() } else { line.to_string() }
+            };
+            let split = |s: &str| -> Vec<String> {
+                s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect()
+            };
+            let path = Path::new(&dir);
+            let name = name.unwrap_or_else(|| {
+                path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            });
+            let products = products.unwrap_or_else(|| ask("products (pa, coder or pa,coder)", "pa,coder"));
+            let products = split(&products)
+                .iter()
+                .map(|p| match p.as_str() {
+                    "pa" => Ok(aivyx_pack::Product::Pa),
+                    "coder" => Ok(aivyx_pack::Product::Coder),
+                    other => Err(format!("unknown product {other:?} (pa, coder)")),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let publisher = publisher.unwrap_or_else(|| ask("publisher", "Aivyx"));
+            let opts = aivyx_pack::scaffold::NewOptions {
+                name,
+                products,
+                publisher,
+                requires: requires.as_deref().map(split).unwrap_or_default(),
+                optional: optional.as_deref().map(split).unwrap_or_default(),
+            };
+            aivyx_pack::scaffold::scaffold(path, &opts)?;
+            println!("wrote a new pack in {dir}");
+            let steps = aivyx_pack::check::check_dir(path, &aivyx_pack::check::CheckOptions { allow_unchecked: true });
+            print!("{}", aivyx_pack::check::render(&steps));
+            println!(
+                "next: edit the persona, skills and team; `aivyx-pack check {dir}`; \
+                 `aivyx-pack build {dir} --key <keyfile> --out <file>`"
+            );
         }
         Command::HubCheck { dir, trust, allow_placeholders, require_signature, site_dist } => {
             let opts = HubCheckOptions {

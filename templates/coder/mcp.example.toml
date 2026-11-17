@@ -1,0 +1,10 @@
+# Optional MCP servers. To ship them, rename this file to mcp.toml and
+# uncomment `mcp` in manifest.toml. Each user is asked to approve every
+# server on `aivyx-coder pack use`, and the approval is pinned to the exact
+# command and arguments below — change them and users are asked again.
+
+# [[servers]]
+# name = "files"
+# command = "mcp-files"
+# args = ["--root", "."]
+# timeout_secs = 30

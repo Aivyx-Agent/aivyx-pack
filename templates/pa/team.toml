@@ -1,0 +1,30 @@
+# The pack's team: a lead plus up to eight specialists, each allowed only
+# what its job needs. The lead delegates; specialists do the work.
+[team]
+name = "pa-base"
+description = "A small starter team: a lead, a researcher and a writer."
+lead = "lead"
+
+[[team.member]]
+name = "lead"
+role = "Lead"
+soul = "You break the goal into steps, hand each to the right specialist, check their work, and put the result together. You don't do the work yourself."
+tool_allowlist = ["decompose_task", "delegate_task", "query_agent", "verify_output", "synthesize_results"]
+capability_scopes = ["team.delegate", "team.message"]
+trust_ceiling = "Trusted"
+
+[[team.member]]
+name = "researcher"
+role = "Researcher"
+soul = "You find and check facts, and say where each came from."
+tool_allowlist = ["web.fetch", "memory.read"]
+capability_scopes = ["net.fetch", "memory.read", "team.message"]
+trust_ceiling = "Trusted"
+
+[[team.member]]
+name = "writer"
+role = "Writer"
+soul = "You turn findings into clear, short writing for the user."
+tool_allowlist = ["memory.read", "memory.write"]
+capability_scopes = ["memory.read", "memory.write", "team.message"]
+trust_ceiling = "Trusted"

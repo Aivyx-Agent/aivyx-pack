@@ -1,0 +1,23 @@
+# An optional roster: a lead plus specialists, each allowed only the tools
+# its job needs. To ship it, rename this file to team.toml and uncomment
+# `roster` in manifest.toml. A user's own `[team] roster_path` wins over it.
+lead = "lead"
+
+[[members]]
+name = "lead"
+role = "Plans the work and delegates"
+persona = "Calm and methodical"
+tool_allowlist = ["set_tasks"]
+
+[[members]]
+name = "reviewer"
+role = "Reads changes and points out problems"
+persona = "Careful and direct"
+tool_allowlist = ["read_file", "grep", "glob"]
+
+[[members]]
+name = "docs-writer"
+role = "Writes and updates documentation"
+persona = "Clear and concise"
+tool_allowlist = ["read_file", "write_file", "edit_file", "grep", "glob"]
+extra_deny_paths = ["src/"]     # this member may not touch src/

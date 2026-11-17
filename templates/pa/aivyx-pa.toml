@@ -1,0 +1,54 @@
+# description: A starter assistant — copy this pack and make it yours.
+#
+# The starting config of every assistant installed from this pack.
+# `aivyx-pa pack install` runs the usual setup with these answers
+# pre-filled; the user still picks the model and sets the passphrase.
+# Keep autonomy at or below `supervised` — a pack can't go higher.
+
+# Placeholders — the setup wizard replaces these with the user's choice.
+[agent]
+provider = "ollama"
+model = "llama3.1"
+
+# Who the assistant is and who it works for. Every turn reads this.
+[profile]
+assistant_name = "Assistant"
+# Who the user is, in one or two sentences.
+operator_profile = "A person who wants help staying on top of their work."
+# How replies should read.
+communication_style = "Conclusion first, short paragraphs, plain words."
+# What the assistant is mainly for.
+primary_use_cases = ["planning the week", "keeping notes"]
+# Habits the assistant should keep.
+behavioral_preferences = ["say what it did and what's left"]
+# Lines it never crosses.
+behavioral_constraints = ["never send anything on the user's behalf without asking"]
+
+# Facts the assistant starts out knowing about the user's domain.
+[persona_seed]
+learned_context = ["The user reviews their week every Friday afternoon."]
+
+# The `default` role (the one aivyx-pa uses unless told otherwise):
+# what the assistant may use.
+[[role]]
+name = "default"
+system_prompt = "You are a helpful assistant. Be concrete and brief."
+tool_allowlist = ["memory.read", "memory.write", "fs.read", "web.fetch"]
+capability_scopes = ["memory.read", "memory.write", "fs.read", "net.fetch"]
+trust_ceiling = "Trusted"
+
+# Autonomy: `assisted` asks before anything irreversible. An area at
+# `supervised` parks such steps from routines for the user to review.
+[autonomy]
+level = "assisted"
+
+[[autonomy.override]]
+domain = "fs"
+level = "supervised"
+
+# Routines: cron patterns have 6 or 7 fields, seconds first, in local time.
+[[schedule]]
+name = "weekly-review"
+cron = "0 0 16 * * Fri"
+role = "default"
+prompt = "Run the weekly-review skill: what got done this week, what slipped, and what matters next week."

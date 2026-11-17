@@ -334,3 +334,25 @@ fn check_fails_on_a_tool_pack_or_a_missing_manifest() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("tool pack (format 1)"), "{text}");
 }
+
+#[test]
+fn new_writes_a_pack_that_checks() {
+    let dir = tempdir("new");
+    let pack = dir.join("my-pack");
+    let out = bin()
+        .args(["new"])
+        .arg(&pack)
+        .args(["--products", "coder", "--publisher", "Aivyx"])
+        .env_remove("AIVYX_CODER")
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("The pack passes."), "{text}");
+    let manifest = std::fs::read_to_string(pack.join("manifest.toml")).unwrap();
+    assert!(manifest.contains("name = \"my-pack\""), "{manifest}");
+    assert!(manifest.contains("min_version = \"1.0.0\""), "{manifest}");
+    let again = bin().args(["new"]).arg(&pack).args(["--products", "coder"]).output().unwrap();
+    assert!(!again.status.success(), "a non-empty folder is refused");
+}
