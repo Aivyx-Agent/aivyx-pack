@@ -2,8 +2,8 @@
 //! `checks.toml` and the products' lints replaced, a mutation the Python test
 //! would have caught makes `aivyx-pack check` fail.
 //!
-//! The pack is private, so nothing of it is embedded here: the test copies it
-//! from `AIVYX_BM_DIR` at run time and edits the copy.
+//! The pack is private and is read from `AIVYX_BM_DIR` at run time; the rows
+//! quote short fragments of its published files to mutate them (on a copy).
 //!
 //! AIVYX_BM_DIR=<aivyx-verticals>/packs/business-manager AIVYX_PA=<bin> AIVYX_CODER=<bin> \
 //!   cargo test --test bm_parity -- --ignored
@@ -352,6 +352,45 @@ const CASES: &[Case] = &[
         "coder/skills/data-cleanup/SKILL.md",
         &[("head -n 20", "cat")],
         "\"head -n 20\"",
+    ),
+    (
+        "agents_mentions load_skill",
+        "coder/AGENTS.md",
+        &[("`load_skill`", "the loader")],
+        "AGENTS.md doesn't mention \"`load_skill`\"",
+    ),
+    (
+        "routine_names",
+        PA,
+        &[(
+            "name = \"morning-briefing\"\ncron",
+            "name = \"morning-brief\"\ncron",
+        )],
+        "routines: missing",
+    ),
+    (
+        "team members",
+        TEAM,
+        &[("name = \"scout\"", "name = \"scouts\"")],
+        "team members: missing",
+    ),
+    (
+        "per-skill forbids",
+        "pa/skills/weekly-review/SKILL.md",
+        &[(
+            "**Never:** mark",
+            "**Never:** `memory.write` topic `business-profile`; mark",
+        )],
+        "which checks.toml forbids",
+    ),
+    (
+        "team_mission",
+        PA,
+        &[(
+            "name = \"morning-briefing\"\ncron = \"0 30 7 * * Mon-Fri\"\n",
+            "name = \"morning-briefing\"\ncron = \"0 30 7 * * Mon-Fri\"\nprompt = \"x\"\n",
+        )],
+        "isn't a team mission",
     ),
 ];
 
