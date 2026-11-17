@@ -254,12 +254,16 @@ fn steps(text: &str) -> &str {
 
 fn text_rules(p: &mut Vec<String>, what: &str, text: &str, must: &[String], must_not: &[String]) {
     for m in must {
-        if !mentions(text, m) {
+        if m.trim().is_empty() {
+            p.push(format!("checks.toml has empty text in mentions for {what}"));
+        } else if !mentions(text, m) {
             p.push(format!("{what} doesn't mention {m:?}"));
         }
     }
     for f in must_not {
-        if mentions(text, f) {
+        if f.trim().is_empty() {
+            p.push(format!("checks.toml has empty text in forbids for {what}"));
+        } else if mentions(text, f) {
             p.push(format!("{what} mentions {f:?}, which checks.toml forbids"));
         }
     }
@@ -329,20 +333,27 @@ fn strings(t: &toml::Table, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `<rel>/<name>/SKILL.md` for every skill folder, by name.
-fn read_skills(dir: &Path, rel: Option<&str>) -> Result<BTreeMap<String, String>, String> {
+/// `<rel>/<name>/SKILL.md` for every skill folder, by name. A folder with no
+/// readable SKILL.md is an error naming it, never skipped.
+fn read_skills(
+    dir: &Path,
+    rel: Option<&str>,
+    label: &str,
+) -> Result<BTreeMap<String, String>, String> {
     let mut out = BTreeMap::new();
     let Some(rel) = rel else {
         return Ok(out);
     };
     let entries = std::fs::read_dir(dir.join(rel)).map_err(|e| format!("can't read {rel}: {e}"))?;
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(String::from) else {
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("can't read an entry of {rel}: {e}"))?;
+        if !entry.path().is_dir() {
             continue;
-        };
-        if let Ok(text) = std::fs::read_to_string(entry.path().join("SKILL.md")) {
-            out.insert(name, text);
         }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let text = std::fs::read_to_string(entry.path().join("SKILL.md"))
+            .map_err(|e| format!("{label} skill folder `{name}` has no readable SKILL.md: {e}"))?;
+        out.insert(name, text);
     }
     Ok(out)
 }
@@ -437,7 +448,7 @@ impl PaView {
                 let t = doc
                     .get("team")
                     .and_then(|v| v.as_table())
-                    .ok_or(format!("{rel} has no [team] table"))?;
+                    .ok_or_else(|| format!("{rel} has no [team] table"))?;
                 Some(Team {
                     name: string(t, "name"),
                     lead: string(t, "lead"),
@@ -448,7 +459,7 @@ impl PaView {
                 })
             }
         };
-        let skills = read_skills(dir, part.skills.as_deref())?;
+        let skills = read_skills(dir, part.skills.as_deref(), "pa")?;
         Ok(PaView {
             roles,
             team,
@@ -485,7 +496,7 @@ impl CoderView {
             .map_err(|e| format!("can't read {}: {e}", part.agents_file))?;
         Ok(CoderView {
             agents,
-            skills: read_skills(dir, part.skills.as_deref())?,
+            skills: read_skills(dir, part.skills.as_deref(), "coder")?,
         })
     }
 }
@@ -877,7 +888,7 @@ lead = "lead"
 
 [[team.member]]
 name = "lead"
-tool_allowlist = ["delegate_task", "memory.read"]
+tool_allowlist = ["delegate_task", "send_message", "memory.read"]
 capability_scopes = ["team.delegate", "memory.read", "team.message"]
 
 [[team.member]]
@@ -906,7 +917,7 @@ mentions = ["never send", "business-profile"]
 [pa.skill.brief]
 runs_on = ["inbox"]
 mentions = ["gmail.draft", "never send"]
-forbids = ["gmail.send"]
+forbids = ["send it now"]
 
 [pa.routines.morning]
 cron = "0 30 7 * * Mon-Fri"
@@ -918,6 +929,7 @@ name = "demo"
 lead = "lead"
 members = ["lead", "inbox"]
 every_member_scopes = ["team.message"]
+every_member_holds = ["send_message"]
 
 [pa.team.member.lead]
 holds = ["delegate_task", "memory.read"]
@@ -936,6 +948,7 @@ agents_mentions = ["plain language"]
 
 [coder.skill.tidy]
 mentions = ["how to undo"]
+forbids = ["force push"]
 "#;
 
     fn pack(tag: &str) -> PathBuf {
@@ -980,7 +993,7 @@ mentions = ["how to undo"]
         out
     }
 
-    /// Mutate a good pack and expect exactly one problem containing `want`.
+    /// Mutate a good pack and expect a problem containing `want`.
     fn fails(tag: &str, rel: &str, from: &str, to: &str, want: &str) {
         let dir = pack(tag);
         edit(&dir, rel, from, to);
@@ -1096,8 +1109,8 @@ mentions = ["how to undo"]
             "forbids",
             "pa/skills/brief/SKILL.md",
             "mornings",
-            "mornings, maybe gmail.send",
-            "forbids",
+            "mornings, send it now",
+            "pa skill `brief` mentions \"send it now\", which checks.toml forbids",
         );
         fails(
             "routine-cron",
@@ -1158,8 +1171,8 @@ mentions = ["how to undo"]
         fails(
             "holds-only",
             "pa/team.toml",
-            "[\"delegate_task\", \"memory.read\"]",
-            "[\"delegate_task\", \"memory.read\", \"web.search\"]",
+            "\"memory.read\"]",
+            "\"memory.read\", \"web.search\"]",
             "beyond its holds_only",
         );
         fails(
@@ -1212,7 +1225,6 @@ mentions = ["how to undo"]
         let extra = dir.join("pa/skills/extra/SKILL.md");
         std::fs::create_dir_all(extra.parent().unwrap()).unwrap();
         std::fs::write(extra, PA_SKILL.replace("name: brief", "name: extra")).unwrap();
-        std::fs::create_dir_all(dir.join("coder/skills/gone")).unwrap();
         std::fs::remove_dir_all(dir.join("coder/skills/tidy")).unwrap();
         let p = problems(&dir);
         assert!(
@@ -1244,5 +1256,183 @@ mentions = ["how to undo"]
             p.iter().any(|l| l.contains("no aivyx-coder part")),
             "{p:#?}"
         );
+    }
+
+    #[test]
+    fn coder_skill_forbids_catches_its_text() {
+        fails(
+            "coder-forbids",
+            "coder/skills/tidy/SKILL.md",
+            "asked.",
+            "asked; force push.",
+            "coder skill `tidy` mentions \"force push\", which checks.toml forbids",
+        );
+    }
+
+    #[test]
+    fn every_other_rule_catches_its_break() {
+        let pa = "pa/aivyx-pa.toml";
+        let team = "pa/team.toml";
+        fails(
+            "pack-config",
+            pa,
+            "[schedule.team_mission]\n",
+            "[schedule.team_mission]\npack_config = \"x\"\n",
+            "routine `morning` sets team_mission.pack_config",
+        );
+        fails(
+            "routine-role",
+            pa,
+            "cron = \"0 30 7 * * Mon-Fri\"",
+            "cron = \"0 30 7 * * Mon-Fri\"\nrole = \"default\"",
+            "routine `morning` isn't a team mission",
+        );
+        fails(
+            "every-holds",
+            team,
+            "\"skill_defaults.read\", \"send_message\"]",
+            "\"skill_defaults.read\"]",
+            "team member `inbox` doesn't hold `send_message`",
+        );
+        fails(
+            "team-name",
+            team,
+            "name = \"demo\"",
+            "name = \"other\"",
+            "the team is named `other`, not `demo`",
+        );
+        fails(
+            "override-set",
+            pa,
+            "[[schedule]]",
+            "[[autonomy.override]]\ndomain = \"calendar\"\nlevel = \"supervised\"\n\n[[schedule]]",
+            "autonomy overrides: not listed in checks.toml [\"calendar\"]",
+        );
+        fails(
+            "pa-sections",
+            CHECKS_FILE,
+            "[pa.skill.brief]\n",
+            "[pa.skill.brief]\nsections = [\"When\", \"Why\"]\n",
+            "pa skill `brief` has no **Why:** section",
+        );
+        fails(
+            "coder-sections",
+            CHECKS_FILE,
+            "[coder.skill.tidy]\n",
+            "[coder.skill.tidy]\nsections = [\"When\", \"Why\"]\n",
+            "coder skill `tidy` has no **Why:** section",
+        );
+        for (tag, from, to, want) in [
+            (
+                "ghost-role",
+                "[pa.roles.default]",
+                "[pa.roles.ghost]",
+                "checks.toml names role `ghost`, which the template doesn't have",
+            ),
+            (
+                "ghost-skill",
+                "[pa.skill.brief]",
+                "[pa.skill.ghost]",
+                "checks.toml names pa skill `ghost`, which the pack doesn't have",
+            ),
+            (
+                "ghost-routine",
+                "[pa.routines.morning]",
+                "[pa.routines.ghost]",
+                "checks.toml names routine `ghost`, which the template doesn't have",
+            ),
+            (
+                "ghost-member",
+                "[pa.team.member.inbox]",
+                "[pa.team.member.ghost]",
+                "checks.toml names team member `ghost`, which the team doesn't have",
+            ),
+            (
+                "ghost-coder",
+                "[coder.skill.tidy]",
+                "[coder.skill.ghost]",
+                "checks.toml names coder skill `ghost`, which the pack doesn't have",
+            ),
+        ] {
+            fails(tag, CHECKS_FILE, from, to, want);
+        }
+        fails(
+            "unknown-runs-on",
+            CHECKS_FILE,
+            "runs_on = [\"inbox\"]",
+            "runs_on = [\"inbox\", \"nobody\"]",
+            "runs_on `nobody`, which isn't a team member or `role:<name>`",
+        );
+        fails(
+            "no-team-lp",
+            "manifest.toml",
+            "team_config = \"pa/team.toml\"\n",
+            "",
+            "least_privilege is set, but the pack has no team",
+        );
+        fails(
+            "no-team-checks",
+            "manifest.toml",
+            "team_config = \"pa/team.toml\"\n",
+            "",
+            "checks.toml has [pa.team] checks, but the pack has no team config",
+        );
+        fails(
+            "empty-mentions",
+            CHECKS_FILE,
+            "mentions = [\"gmail.draft\", \"never send\"]",
+            "mentions = [\"gmail.draft\", \"\", \"never send\"]",
+            "empty text in mentions for pa skill `brief`",
+        );
+        fails(
+            "empty-forbids",
+            CHECKS_FILE,
+            "forbids = [\"send it now\"]",
+            "forbids = [\"\"]",
+            "empty text in forbids for pa skill `brief`",
+        );
+    }
+
+    #[test]
+    fn a_role_can_be_where_a_skill_runs() {
+        let dir = pack("role-runs-on");
+        edit(
+            &dir,
+            CHECKS_FILE,
+            "runs_on = [\"inbox\"]",
+            "runs_on = [\"inbox\", \"role:default\"]",
+        );
+        assert_eq!(problems(&dir), Vec::<String>::new());
+    }
+
+    #[test]
+    fn checks_for_a_missing_pa_part_are_reported() {
+        let dir = pack("no-pa");
+        let text = std::fs::read_to_string(dir.join("manifest.toml")).unwrap();
+        let (head, rest) = text.split_once("\n[pa]").unwrap();
+        let coder = rest.split_once("\n[coder]").unwrap().1;
+        let manifest =
+            format!("{head}\n[coder]{coder}").replace("[\"pa\", \"coder\"]", "[\"coder\"]");
+        std::fs::write(dir.join("manifest.toml"), manifest).unwrap();
+        let p = problems(&dir);
+        assert!(
+            p.iter()
+                .any(|l| l.contains("has [pa] checks, but the pack has no aivyx-pa part")),
+            "{p:#?}"
+        );
+    }
+
+    #[test]
+    fn a_skill_folder_without_skill_md_is_a_problem() {
+        for (tag, rel, label) in [
+            ("pa-bare", "pa/skills/bare", "pa"),
+            ("coder-bare", "coder/skills/bare", "coder"),
+        ] {
+            let dir = pack(tag);
+            std::fs::create_dir_all(dir.join(rel)).unwrap();
+            let p = problems(&dir);
+            let want = format!("{label} skill folder `bare` has no readable SKILL.md");
+            assert!(p.iter().any(|l| l.contains(&want)), "{tag}: {p:#?}");
+        }
     }
 }
